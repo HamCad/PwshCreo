@@ -959,773 +959,371 @@ function Get-CreoByteNgramStats {
 }
 
 
-# --- new gradient and clustering cmdlets ---
-function Get-CreoByteTransitionStats {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$File,
-        [Parameter(Mandatory)]
-        [byte]$Marker
-    )
 
-    $bytes = [System.IO.File]::ReadAllBytes($File)
-    $transitions = @{}
+# =========================================================================
+# ---------------------------------------------------------------------
+#  MARKER CORRELATION / CLUSTERING (phase 3)
+#
+#  Cleaned-up merge of a second pass at the statistical cmdlets above.
+#  These all resolve streams once via Resolve-CreoFileStreams (through the
+#  Resolve-CreoStreamsNormalized shim below, which also accepts a
+#  pre-resolved -ResolvedStreams object so callers can reuse one resolve
+#  across several of these cmdlets instead of re-parsing the file each
+#  time) and reuse the existing Get-Entropy / Test-CreoStreamRange helpers.
+# ---------------------------------------------------------------------
+# =========================================================================
 
-    for ($i = 1; $i -lt ($bytes.Count - 1); $i++) {
-        if ($bytes[$i] -eq $Marker) {
-            $before = $bytes[$i - 1].ToString("X2")
-            $after = $bytes[$i + 1].ToString("X2")
-            $key = "${before}-${after}"
-            
-            if (-not $transitions.ContainsKey($key)) {
-                $transitions[$key] = [PSCustomObject]@{
-                    Before = $before
-                    Marker = $Marker.ToString("X2")
-                    After = $after
-                    Count = 0
-                }
-            }
-            $transitions[$key].Count++
-        }
-    }
-
-    $transitions.Values | Sort-Object Count -Descending
-}
-
-function Find-CreoStructuralRuns {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$File,
-        [Parameter(Mandatory)]
-        [string]$HexPattern 
-        # Example pattern: "E3(..){3}E1" for E3 xx xx xx E1
-    )
-
-    $bytes = [System.IO.File]::ReadAllBytes($File)
-    $hexString = [System.BitConverter]::ToString($bytes) -replace "-"
-    
-    $matches = [regex]::Matches($hexString, $HexPattern)
-    
-    $results = foreach ($m in $matches) {
-        [PSCustomObject]@{
-            OffsetHex = "0x" + ($m.Index / 2).ToString("X8")
-            Length = $m.Length / 2
-            MatchValue = $m.Value
-        }
-    }
-    
-    $results | Group-Object MatchValue | Select-Object Count, Name | Sort-Object Count -Descending
-}
-
-function Measure-CreoEntropyRegions {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$File,
-        [Parameter()]
-        [int]$WindowSize = 256,
-        [Parameter()]
-        [int]$Step = 64
-    )
-
-    $bytes = [System.IO.File]::ReadAllBytes($File)
-    
-    for ($i = 0; $i -lt ($bytes.Count - $WindowSize); $i += $Step) {
-        $window = $bytes[$i..($i + $WindowSize - 1)]
-        $counts = @{}
-        foreach ($b in $window) { $counts[$b]++ }
-        
-        $entropy = 0.0
-        foreach ($count in $counts.Values) {
-            $p = $count / $WindowSize
-            if ($p -gt 0) { $entropy -= $p * [Math]::Log($p, 2) }
-        }
-        
-        [PSCustomObject]@{
-            Offset = "0x" + $i.ToString("X8")
-            Entropy = [Math]::Round($entropy, 2)
-        }
-    }
-}
-
-function Find-CreoMarkerClusters {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$File,
-        [Parameter(Mandatory)]
-        [byte]$Marker,
-        [Parameter()]
-        [int]$Tolerance = 5 
-    )
-
-    $bytes = [System.IO.File]::ReadAllBytes($File)
-    $positions = @()
-    
-    for ($i = 0; $i -lt $bytes.Count; $i++) {
-        if ($bytes[$i] -eq $Marker) { $positions += $i }
-    }
-
-    if ($positions.Count -lt 2) { return }
-
-    $clusters = @{}
-    for ($i = 0; $i -lt ($positions.Count - 1); $i++) {
-        $spacing = $positions[$i+1] - $positions[$i]
-        
-        # Group spacings within the tolerance window
-        $clusterKey = [Math]::Round($spacing / $Tolerance) * $Tolerance
-        
-        if (-not $clusters.ContainsKey($clusterKey)) {
-            $clusters[$clusterKey] = @{ Count = 0; StartsAt = $positions[$i] }
-        }
-        $clusters[$clusterKey].Count++
-    }
-
-    $clusters.GetEnumerator() | Sort-Object {$_.Value.Count} -Descending | Select-Object @{Name="MedianSpacing";Expression={$_.Name}}, @{Name="StartOffset";Expression={"0x" + $_.Value.StartsAt.ToString("X8")}}, @{Name="ClusterSize";Expression={$_.Value.Count}}
-}
-
-function Get-CreoCandidateMarkers {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$File
-    )
-
-    $bytes = [System.IO.File]::ReadAllBytes($File)
-    $byteCounts = @{}
-    
-    # Fast count
-    foreach ($b in $bytes) { $byteCounts[$b]++ }
-
-    $candidates = @()
-    foreach ($key in $byteCounts.Keys) {
-        # Filter noise: 00, FF, and ASCII (0x20 to 0x7E)
-        if ($key -eq 0x00 -or $key -eq 0xFF -or ($key -ge 0x20 -and $key -le 0x7E)) { continue }
-
-        $freq = $byteCounts[$key]
-        if ($freq -lt 10) { continue } # Minimum threshold
-
-        # Simplified Heuristic Score = (Frequency * Arbitrary Weighting) 
-        # Note: You can expand this to include entropy neighborhood checks
-        $score = $freq * 1.5 
-
-        $candidates += [PSCustomObject]@{
-            HexMarker = $key.ToString("X2")
-            Frequency = $freq
-            Score = $score
-        }
-    }
-
-    $candidates | Sort-Object Score -Descending | Select-Object -First 15
-}
-
-function Get-CreoMarkerPairs {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$File,
-        
-        [Parameter(Mandatory, ValueFromPipeline)]
-        [object[]]$ResolvedStreams
-    )
-
-    begin {
-        $fileBytes = [System.IO.File]::ReadAllBytes($File)
-        $pairStats = @{}
-    }
-
-    process {
-        foreach ($stream in $ResolvedStreams) {
-            # Ensure we only look at the actual payload, ignoring headers/padding
-            $start = $stream.PayloadStart
-            $length = $stream.PayloadLength
-            $end = $start + $length - 1
-
-            # Prevent out-of-bounds reading
-            if ($start -lt 0 -or $end -ge $fileBytes.Count -or $length -lt 2) { continue }
-
-            $lastPos = @{}
-
-            for ($i = $start; $i -lt $end; $i++) {
-                $b1 = $fileBytes[$i].ToString("X2")
-                $b2 = $fileBytes[$i+1].ToString("X2")
-                $sequence = "$b1 $b2"
-
-                if (-not $pairStats.ContainsKey($sequence)) {
-                    $pairStats[$sequence] = @{
-                        Count = 0
-                        Streams = @{}
-                        TotalSpacing = 0
-                        SpacingCount = 0
-                    }
-                }
-
-                $stat = $pairStats[$sequence]
-                $stat.Count++
-                $stat.Streams[$stream.StreamName] = $true
-
-                # Calculate spacing if we've seen this pair in this stream before
-                if ($lastPos.ContainsKey($sequence)) {
-                    $distance = $i - $lastPos[$sequence]
-                    $stat.TotalSpacing += $distance
-                    $stat.SpacingCount++
-                }
-                
-                $lastPos[$sequence] = $i
-            }
-        }
-    }
-
-    end {
-        $results = foreach ($seq in $pairStats.Keys) {
-            $data = $pairStats[$seq]
-            $avgSpacing = if ($data.SpacingCount -gt 0) { 
-                [Math]::Round($data.TotalSpacing / $data.SpacingCount, 2) 
-            } else { 0 }
-
-            [PSCustomObject]@{
-                Sequence   = $seq
-                Count      = $data.Count
-                Streams    = $data.Streams.Count
-                AvgSpacing = $avgSpacing
-            }
-        }
-
-        # Filter out 00 00 noise or extremely low-frequency hits before returning
-        $results | Where-Object { $_.Sequence -ne "00 00" -and $_.Count -gt 10 } | 
-                   Sort-Object Count -Descending
-    }
-}
-
-function Resolve-CreoStreamsNormalized {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$File,
-
-        [Parameter()]
-        $ResolvedStreams
-    )
-
-    if ($null -ne $ResolvedStreams) {
-
-        if ($ResolvedStreams.PSObject.Properties['Streams']) {
-            return @($ResolvedStreams.Streams)
-        }
-
-        if ($ResolvedStreams -is [System.Array]) {
-            $first = $ResolvedStreams | Select-Object -First 1
-
-            if ($first -and $first.PSObject.Properties['Streams']) {
-                return @($first.Streams)
-            }
-
-            return @($ResolvedStreams)
-        }
-
-        return @($ResolvedStreams)
-    }
-
-    $resolved = Resolve-CreoFileStreams -File $File
-
-    if ($null -eq $resolved) {
-        return @()
-    }
-
-    if ($resolved.PSObject.Properties['Streams']) {
-        return @($resolved.Streams)
-    }
-
-    return @($resolved)
-}
-
-
+# =========================================================================
+# FUNCTION: Test-CreoStreamRange
+#   Guards against a stream whose PayloadStart/PayloadLength don't resolve
+#   to a valid, in-bounds range before any of the cmdlets below touch it.
+# =========================================================================
 function Test-CreoStreamRange {
     param(
-        [Parameter(Mandatory)]
-        $Stream,
-
-        [Parameter(Mandatory)]
-        [int]$FileLength
+        [Parameter(Mandatory)]$Stream,
+        [Parameter(Mandatory)][int]$FileLength
     )
 
-    if ($null -eq $Stream) {
-        return $false
-    }
-
-    if (-not ($Stream.PSObject.Properties['PayloadStart'])) {
-        return $false
-    }
-
-    if (-not ($Stream.PSObject.Properties['PayloadLength'])) {
-        return $false
-    }
+    if ($null -eq $Stream) { return $false }
+    if (-not $Stream.PSObject.Properties['PayloadStart']) { return $false }
+    if (-not $Stream.PSObject.Properties['PayloadLength']) { return $false }
 
     $start = [int]$Stream.PayloadStart
     $length = [int]$Stream.PayloadLength
 
-    if ($start -lt 0) {
-        return $false
-    }
-
-    if ($length -le 0) {
-        return $false
-    }
-
-    if (($start + $length) -gt $FileLength) {
-        return $false
-    }
+    if ($start -lt 0) { return $false }
+    if ($length -le 0) { return $false }
+    if (($start + $length) -gt $FileLength) { return $false }
 
     return $true
 }
 
-
-function Get-CreoEntropy {
+# =========================================================================
+# FUNCTION: Resolve-CreoStreamsNormalized
+#   Thin wrapper around Resolve-CreoFileStreams: resolves the file if the
+#   caller didn't already pass -ResolvedStreams, otherwise reuses it. Since
+#   Resolve-CreoFileStreams has one fixed return shape (an object with a
+#   .Streams property), this no longer needs to sniff arbitrary shapes.
+# =========================================================================
+function Resolve-CreoStreamsNormalized {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [byte[]]$Bytes
+        [Parameter(Mandatory)][string]$File,
+        [Parameter()]$ResolvedStreams
     )
 
-    if ($Bytes.Count -eq 0) {
-        return 0
+    if ($null -ne $ResolvedStreams) {
+        return @($ResolvedStreams.Streams)
     }
 
-    $counts = @{}
-
-    foreach ($b in $Bytes) {
-        if ($counts.ContainsKey($b)) {
-            $counts[$b]++
-        }
-        else {
-            $counts[$b] = 1
-        }
-    }
-
-    $entropy = 0.0
-
-    foreach ($count in $counts.Values) {
-        $p = $count / $Bytes.Count
-        $entropy -= $p * [Math]::Log($p,2)
-    }
-
-    return $entropy
+    return @((Resolve-CreoFileStreams -File $File).Streams)
 }
 
+# =========================================================================
+# FUNCTION: Get-CreoByteTransitionStats
+#   For a given marker byte, tallies the (before-byte, after-byte) pairs
+#   that surround each occurrence within resolved stream payloads - a
+#   first-order view of what typically flanks a marker.
+# =========================================================================
 function Get-CreoByteTransitionStats {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$File,
-
-        [Parameter(Mandatory)]
-        [byte]$Marker,
-
-        [Parameter()]
-        $ResolvedStreams
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][byte]$Marker,
+        [Parameter()]$ResolvedStreams
     )
 
     $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
-    $bytes = [System.IO.File]::ReadAllBytes($File)
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
 
     $stats = @{}
 
     foreach ($stream in $streams) {
-
-        if (-not (Test-CreoStreamRange $stream $bytes.Length)) {
-            continue
-        }
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
         $start = [int]$stream.PayloadStart
         $end = $start + [int]$stream.PayloadLength - 1
 
-        for ($i=$start+1; $i -lt $end; $i++) {
+        for ($i = $start + 1; $i -lt $end; $i++) {
+            if ($bytes[$i] -ne $Marker) { continue }
 
-            if ($bytes[$i] -ne $Marker) {
-                continue
-            }
-
-            $key = "{0:X2}-{1:X2}" -f $bytes[$i-1],$bytes[$i+1]
+            $key = "{0:X2}-{1:X2}" -f $bytes[$i-1], $bytes[$i+1]
 
             if (-not $stats.ContainsKey($key)) {
-
                 $stats[$key] = @{
-                    Before = $bytes[$i-1].ToString("X2")
-                    After = $bytes[$i+1].ToString("X2")
-                    Count = 0
+                    Before  = $bytes[$i-1].ToString("X2")
+                    After   = $bytes[$i+1].ToString("X2")
+                    Count   = 0
                     Streams = [System.Collections.Generic.HashSet[string]]::new()
                     Examples = [System.Collections.Generic.List[string]]::new()
                 }
             }
 
             $s = $stats[$key]
-
             $s.Count++
             [void]$s.Streams.Add($stream.Name)
-
             if ($s.Examples.Count -lt 3) {
                 $s.Examples.Add(("0x{0:X8}" -f $i))
             }
         }
     }
 
-
-    foreach ($s in $stats.Values) {
-
+    $output = foreach ($s in $stats.Values) {
         [PSCustomObject]@{
-            Marker = $Marker.ToString("X2")
-            BeforeByte = $s.Before
-            AfterByte = $s.After
-            Count = $s.Count
+            Marker          = $Marker.ToString("X2")
+            BeforeByte      = $s.Before
+            AfterByte       = $s.After
+            Count           = $s.Count
             DistinctStreams = $s.Streams.Count
-            ExampleOffsets = ($s.Examples -join ", ")
+            ExampleOffsets  = ($s.Examples -join ", ")
         }
     }
-    | Sort-Object Count -Descending
+
+    return $output | Sort-Object -Property Count -Descending
 }
 
+# =========================================================================
+# FUNCTION: Find-CreoStructuralRuns
+#   Wildcard byte-pattern search over resolved stream payloads. Pattern is
+#   a hex string where "??" matches any byte, e.g. "E3????E1" for
+#   E3 xx xx xx E1. Spaces in the pattern are ignored.
+# =========================================================================
 function Find-CreoStructuralRuns {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$File,
-
-        [Parameter(Mandatory)]
-        [string]$Pattern,
-
-        [Parameter()]
-        $ResolvedStreams
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string]$Pattern,
+        [Parameter()]$ResolvedStreams
     )
 
     $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
-    $bytes = [System.IO.File]::ReadAllBytes($File)
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
 
-    $cleanPattern = $Pattern.ToUpper().Replace(" ","")
-
+    $cleanPattern = $Pattern.ToUpper().Replace(" ", "")
     if ($cleanPattern.Length % 2 -ne 0) {
         throw "Pattern must contain complete bytes."
     }
 
     $pattern = @()
-
-    for ($i=0;$i -lt $cleanPattern.Length;$i+=2) {
-
-        $pair = $cleanPattern.Substring($i,2)
-
+    for ($i = 0; $i -lt $cleanPattern.Length; $i += 2) {
+        $pair = $cleanPattern.Substring($i, 2)
         if ($pair -eq "??") {
             $pattern += $null
         }
         else {
-            $pattern += [Convert]::ToByte($pair,16)
+            $pattern += [Convert]::ToByte($pair, 16)
         }
     }
 
-
     $results = [System.Collections.Generic.List[object]]::new()
 
-
     foreach ($stream in $streams) {
-
-        if (-not (Test-CreoStreamRange $stream $bytes.Length)) {
-            continue
-        }
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
         $start = [int]$stream.PayloadStart
         $end = $start + [int]$stream.PayloadLength - $pattern.Count
 
-
-        for ($offset=$start;$offset -le $end;$offset++) {
-
-            $match=$true
-
-            for ($j=0;$j -lt $pattern.Count;$j++) {
-
-                if ($null -ne $pattern[$j] -and
-                    $bytes[$offset+$j] -ne $pattern[$j]) {
-
-                    $match=$false
+        for ($offset = $start; $offset -le $end; $offset++) {
+            $match = $true
+            for ($j = 0; $j -lt $pattern.Count; $j++) {
+                if ($null -ne $pattern[$j] -and $bytes[$offset + $j] -ne $pattern[$j]) {
+                    $match = $false
                     break
                 }
             }
 
-
             if ($match) {
-
-                $slice=$bytes[$offset..($offset+$pattern.Count-1)]
-
+                $slice = $bytes[$offset..($offset + $pattern.Count - 1)]
                 $results.Add([PSCustomObject]@{
-                    Stream=$stream.Name
-                    AbsoluteOffset=("0x{0:X8}" -f $offset)
-                    RelativeOffset=("0x{0:X8}" -f ($offset-$start))
-                    Length=$pattern.Count
-                    MatchedBytes=([BitConverter]::ToString($slice) -replace "-"," ")
+                    Stream         = $stream.Name
+                    AbsoluteOffset = ("0x{0:X8}" -f $offset)
+                    RelativeOffset = ("0x{0:X8}" -f ($offset - $start))
+                    Length         = $pattern.Count
+                    MatchedBytes   = ([BitConverter]::ToString($slice) -replace "-", " ")
                 })
             }
         }
     }
 
-    $results
+    return $results
 }
 
+# =========================================================================
+# FUNCTION: Measure-CreoEntropyRegions
+#   Slides a fixed-size window across each resolved stream payload,
+#   reporting entropy and entropy delta between consecutive windows -
+#   useful for spotting where a stream transitions between text-like,
+#   structural, and compressed/encrypted-looking regions.
+# =========================================================================
 function Measure-CreoEntropyRegions {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$File,
-
-        [Parameter()]
+        [Parameter(Mandatory)][string]$File,
         [int]$WindowSize = 256,
-
-        [Parameter()]
         [int]$Step = 64,
-
-        [Parameter()]
-        $ResolvedStreams
+        [Parameter()]$ResolvedStreams
     )
 
     $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
-    $bytes = [System.IO.File]::ReadAllBytes($File)
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
 
     $results = [System.Collections.Generic.List[object]]::new()
 
     foreach ($stream in $streams) {
-
-        if (-not (Test-CreoStreamRange $stream $bytes.Length)) {
-            continue
-        }
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
         $start = [int]$stream.PayloadStart
         $length = [int]$stream.PayloadLength
-
-        if ($length -lt $WindowSize) {
-            continue
-        }
-
+        if ($length -lt $WindowSize) { continue }
 
         $previous = $null
 
-        for ($offset=0; $offset -le ($length-$WindowSize); $offset += $Step) {
-
+        for ($offset = 0; $offset -le ($length - $WindowSize); $offset += $Step) {
             $absolute = $start + $offset
-
-            $window = $bytes[$absolute..($absolute+$WindowSize-1)]
-
-            $entropy = [Math]::Round(
-                (Get-CreoEntropy -Bytes $window),
-                4
-            )
-
+            $window = $bytes[$absolute..($absolute + $WindowSize - 1)]
+            $entropy = [Math]::Round((Get-Entropy -Data $window), 4)
 
             $delta = 0
-
             if ($null -ne $previous) {
-                $delta = [Math]::Round(
-                    ($entropy-$previous),
-                    4
-                )
+                $delta = [Math]::Round(($entropy - $previous), 4)
             }
 
-
             $results.Add([PSCustomObject]@{
-                Stream=$stream.Name
-                AbsoluteOffset=("0x{0:X8}" -f $absolute)
-                RelativeOffset=("0x{0:X8}" -f $offset)
-                Entropy=$entropy
-                EntropyDelta=$delta
-                WindowSize=$WindowSize
+                Stream         = $stream.Name
+                AbsoluteOffset = ("0x{0:X8}" -f $absolute)
+                RelativeOffset = ("0x{0:X8}" -f $offset)
+                Entropy        = $entropy
+                EntropyDelta   = $delta
+                WindowSize     = $WindowSize
             })
 
-
-            $previous=$entropy
+            $previous = $entropy
         }
     }
 
-
-    $results
+    return $results
 }
 
+# =========================================================================
+# FUNCTION: Find-CreoMarkerClusters
+#   Groups consecutive occurrences of a marker byte into clusters (a new
+#   cluster starts whenever the gap to the previous occurrence exceeds
+#   -MaxGap), reporting average/median spacing per cluster. This is the
+#   "marker correlation mining" clustering step from the handoff doc.
+# =========================================================================
 function Find-CreoMarkerClusters {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$File,
-
-        [Parameter(Mandatory)]
-        [byte]$Marker,
-
-        [Parameter()]
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][byte]$Marker,
         [int]$MaxGap = 64,
-
-        [Parameter()]
-        $ResolvedStreams
+        [Parameter()]$ResolvedStreams
     )
 
-
     $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
-    $bytes = [System.IO.File]::ReadAllBytes($File)
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
 
     $results = [System.Collections.Generic.List[object]]::new()
 
+    function _EmitCluster($cluster, $marker, $streamName) {
+        if ($cluster.Count -le 1) { return }
+
+        $spacing = @()
+        for ($j = 0; $j -lt ($cluster.Count - 1); $j++) {
+            $spacing += $cluster[$j+1] - $cluster[$j]
+        }
+        $sortedSpacing = $spacing | Sort-Object
+
+        [PSCustomObject]@{
+            Marker         = $marker.ToString("X2")
+            Stream         = $streamName
+            StartOffset    = ("0x{0:X8}" -f $cluster[0])
+            EndOffset      = ("0x{0:X8}" -f $cluster[$cluster.Count - 1])
+            Occurrences    = $cluster.Count
+            AverageSpacing = [Math]::Round((($spacing | Measure-Object -Average).Average), 2)
+            MedianSpacing  = $sortedSpacing[[Math]::Floor($spacing.Count / 2)]
+        }
+    }
 
     foreach ($stream in $streams) {
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
-        if (-not (Test-CreoStreamRange $stream $bytes.Length)) {
-            continue
+        $start = [int]$stream.PayloadStart
+        $end = $start + [int]$stream.PayloadLength - 1
+
+        $positions = [System.Collections.Generic.List[int]]::new()
+        for ($i = $start; $i -le $end; $i++) {
+            if ($bytes[$i] -eq $Marker) { $positions.Add($i) }
         }
+        if ($positions.Count -lt 2) { continue }
 
-        $start=[int]$stream.PayloadStart
-        $end=$start+[int]$stream.PayloadLength-1
-
-
-        $positions=[System.Collections.Generic.List[int]]::new()
-
-
-        for ($i=$start;$i -le $end;$i++) {
-
-            if ($bytes[$i] -eq $Marker) {
-                $positions.Add($i)
-            }
-        }
-
-
-        if ($positions.Count -lt 2) {
-            continue
-        }
-
-
-        $cluster=[System.Collections.Generic.List[int]]::new()
-
-
-        for ($i=0;$i -lt $positions.Count;$i++) {
-
+        $cluster = [System.Collections.Generic.List[int]]::new()
+        for ($i = 0; $i -lt $positions.Count; $i++) {
             if ($cluster.Count -eq 0) {
                 $cluster.Add($positions[$i])
                 continue
             }
 
-
-            $gap=$positions[$i]-$cluster[$cluster.Count-1]
-
-
+            $gap = $positions[$i] - $cluster[$cluster.Count - 1]
             if ($gap -le $MaxGap) {
                 $cluster.Add($positions[$i])
             }
             else {
-
-                if ($cluster.Count -gt 1) {
-
-                    $spacing=@()
-
-                    for ($j=0;$j -lt ($cluster.Count-1);$j++) {
-                        $spacing += $cluster[$j+1]-$cluster[$j]
-                    }
-
-
-                    $results.Add([PSCustomObject]@{
-                        Marker=$Marker.ToString("X2")
-                        Stream=$stream.Name
-                        StartOffset=("0x{0:X8}" -f $cluster[0])
-                        EndOffset=("0x{0:X8}" -f $cluster[$cluster.Count-1])
-                        Occurrences=$cluster.Count
-                        AverageSpacing=[Math]::Round(
-                            (($spacing | Measure-Object -Average).Average),
-                            2
-                        )
-                        MedianSpacing=(
-                            $spacing | Sort-Object
-                        )[[Math]::Floor($spacing.Count/2)]
-                    })
-                }
-
-                $cluster=[System.Collections.Generic.List[int]]::new()
+                $emitted = _EmitCluster $cluster $Marker $stream.Name
+                if ($emitted) { $results.Add($emitted) }
+                $cluster = [System.Collections.Generic.List[int]]::new()
                 $cluster.Add($positions[$i])
             }
         }
 
-
-        if ($cluster.Count -gt 1) {
-
-            $spacing=@()
-
-            for ($j=0;$j -lt ($cluster.Count-1);$j++) {
-                $spacing += $cluster[$j+1]-$cluster[$j]
-            }
-
-
-            $results.Add([PSCustomObject]@{
-                Marker=$Marker.ToString("X2")
-                Stream=$stream.Name
-                StartOffset=("0x{0:X8}" -f $cluster[0])
-                EndOffset=("0x{0:X8}" -f $cluster[$cluster.Count-1])
-                Occurrences=$cluster.Count
-                AverageSpacing=[Math]::Round(
-                    (($spacing | Measure-Object -Average).Average),
-                    2
-                )
-                MedianSpacing=(
-                    $spacing | Sort-Object
-                )[[Math]::Floor($spacing.Count/2)]
-            })
-        }
+        $emitted = _EmitCluster $cluster $Marker $stream.Name
+        if ($emitted) { $results.Add($emitted) }
     }
 
-
-    $results
+    return $results
 }
 
+# =========================================================================
+# FUNCTION: Get-CreoCandidateMarkers
+#   Auto-discovers candidate marker bytes by frequency, stream coverage,
+#   and neighbor diversity, instead of requiring a pre-guessed list - a
+#   byte that's frequent, appears across many streams, and has few unique
+#   neighbors scores as a more likely structural marker than one that
+#   varies wildly in context.
+# =========================================================================
 function Get-CreoCandidateMarkers {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$File,
-
-        [Parameter()]
+        [Parameter(Mandatory)][string]$File,
         [int]$Top = 50,
-
-        [Parameter()]
-        $ResolvedStreams
+        [Parameter()]$ResolvedStreams
     )
 
-
     $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
-    $bytes=[System.IO.File]::ReadAllBytes($File)
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
 
-
-    $streamCount=[Math]::Max(@($streams).Count,1)
-
-    $stats=@{}
-
+    $streamCount = [Math]::Max(@($streams).Count, 1)
+    $stats = @{}
 
     foreach ($stream in $streams) {
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
-        if (-not (Test-CreoStreamRange $stream $bytes.Length)) {
-            continue
-        }
+        $start = $stream.PayloadStart
+        $end = $start + $stream.PayloadLength - 1
 
-
-        $start=$stream.PayloadStart
-        $end=$start+$stream.PayloadLength-1
-
-
-        for ($i=$start+1;$i -lt $end;$i++) {
-
-            $b=$bytes[$i]
-
+        for ($i = $start + 1; $i -lt $end; $i++) {
+            $b = $bytes[$i]
 
             if (-not $stats.ContainsKey($b)) {
-
-                $stats[$b]=@{
-                    Count=0
-                    Streams=[System.Collections.Generic.HashSet[string]]::new()
-                    Prev=[System.Collections.Generic.HashSet[byte]]::new()
-                    Next=[System.Collections.Generic.HashSet[byte]]::new()
+                $stats[$b] = @{
+                    Count   = 0
+                    Streams = [System.Collections.Generic.HashSet[string]]::new()
+                    Prev    = [System.Collections.Generic.HashSet[byte]]::new()
+                    Next    = [System.Collections.Generic.HashSet[byte]]::new()
                 }
             }
 
-
-            $s=$stats[$b]
-
+            $s = $stats[$b]
             $s.Count++
             [void]$s.Streams.Add($stream.Name)
             [void]$s.Prev.Add($bytes[$i-1])
@@ -1733,208 +1331,116 @@ function Get-CreoCandidateMarkers {
         }
     }
 
-
-    $results=@()
-
-
+    $results = @()
     foreach ($b in $stats.Keys) {
+        # Filter noise: 00, FF, and printable ASCII aren't useful "marker" candidates.
+        if ($b -eq 0x00 -or $b -eq 0xFF -or ($b -ge 0x20 -and $b -le 0x7E)) { continue }
 
+        $s = $stats[$b]
+        if ($s.Count -lt 5) { continue }
 
-        if (
-            $b -eq 0x00 -or
-            $b -eq 0xFF -or
-            ($b -ge 0x20 -and $b -le 0x7E)
-        ) {
-            continue
-        }
-
-
-        $s=$stats[$b]
-
-
-        if ($s.Count -lt 5) {
-            continue
-        }
-
-
-        $coverage=$s.Streams.Count/$streamCount
-
-        $neighborPenalty=
-            [Math]::Max(
-                ($s.Prev.Count+$s.Next.Count),
-                1
-            )
-
-
-        $score=[
-            Math]::Round(
-                ($s.Count*$coverage*100)/$neighborPenalty,
-                2
-            )
-
+        $coverage = $s.Streams.Count / $streamCount
+        $neighborPenalty = [Math]::Max(($s.Prev.Count + $s.Next.Count), 1)
+        $score = [Math]::Round((($s.Count * $coverage * 100) / $neighborPenalty), 2)
 
         $results += [PSCustomObject]@{
-            Marker=("{0:X2}" -f $b)
-            Frequency=$s.Count
-            StreamCount=$s.Streams.Count
-            StreamCoveragePct=[Math]::Round($coverage*100,2)
-            UniquePreviousBytes=$s.Prev.Count
-            UniqueNextBytes=$s.Next.Count
-            Score=$score
+            Marker              = ("{0:X2}" -f $b)
+            Frequency           = $s.Count
+            StreamCount         = $s.Streams.Count
+            StreamCoveragePct   = [Math]::Round($coverage * 100, 2)
+            UniquePreviousBytes = $s.Prev.Count
+            UniqueNextBytes     = $s.Next.Count
+            Score               = $score
         }
     }
 
-
-    $results |
-        Sort-Object Score -Descending |
-        Select-Object -First $Top
+    return $results | Sort-Object -Property Score -Descending | Select-Object -First $Top
 }
 
+# =========================================================================
+# FUNCTION: Get-CreoMarkerPairs
+#   Bigram frequency + spacing stats scoped to resolved stream payloads,
+#   filtering out ASCII-ASCII pairs (already covered by string extraction)
+#   and "00 00" padding noise.
+# =========================================================================
 function Get-CreoMarkerPairs {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$File,
-
-        [Parameter()]
+        [Parameter(Mandatory)][string]$File,
         [int]$MinCount = 5,
-
-        [Parameter()]
         [int]$MaxResults = 50,
-
-        [Parameter()]
-        $ResolvedStreams
+        [Parameter()]$ResolvedStreams
     )
 
+    $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
 
-    $streams=Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
-    $bytes=[System.IO.File]::ReadAllBytes($File)
-
-    $pairs=@{}
-
+    $pairs = @{}
 
     foreach ($stream in $streams) {
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
+        $start = $stream.PayloadStart
+        $end = $start + $stream.PayloadLength - 2
 
-        if (-not (Test-CreoStreamRange $stream $bytes.Length)) {
-            continue
-        }
+        $last = @{}
 
+        for ($i = $start; $i -le $end; $i++) {
+            $a = $bytes[$i]
+            $b = $bytes[$i+1]
 
-        $start=$stream.PayloadStart
-        $end=$start+$stream.PayloadLength-2
+            if (($a -ge 0x20 -and $a -le 0x7E) -and ($b -ge 0x20 -and $b -le 0x7E)) { continue }
+            if ($a -eq 0 -and $b -eq 0) { continue }
 
-
-        $last=@{}
-
-
-        for ($i=$start;$i -le $end;$i++) {
-
-
-            $a=$bytes[$i]
-            $b=$bytes[$i+1]
-
-
-            if (
-                ($a -ge 0x20 -and $a -le 0x7E) -and
-                ($b -ge 0x20 -and $b -le 0x7E)
-            ) {
-                continue
-            }
-
-
-            if ($a -eq 0 -and $b -eq 0) {
-                continue
-            }
-
-
-            $key="{0:X2} {1:X2}" -f $a,$b
-
+            $key = "{0:X2} {1:X2}" -f $a, $b
 
             if (-not $pairs.ContainsKey($key)) {
-
-                $pairs[$key]=@{
-                    Count=0
-                    Streams=[System.Collections.Generic.HashSet[string]]::new()
-                    Spacing=[System.Collections.Generic.List[int]]::new()
-                    Examples=[System.Collections.Generic.List[string]]::new()
+                $pairs[$key] = @{
+                    Count    = 0
+                    Streams  = [System.Collections.Generic.HashSet[string]]::new()
+                    Spacing  = [System.Collections.Generic.List[int]]::new()
+                    Examples = [System.Collections.Generic.List[string]]::new()
                 }
             }
 
-
-            $p=$pairs[$key]
-
+            $p = $pairs[$key]
             $p.Count++
             [void]$p.Streams.Add($stream.Name)
-
-
             if ($p.Examples.Count -lt 3) {
-                $p.Examples.Add(
-                    ("0x{0:X8}" -f $i)
-                )
+                $p.Examples.Add(("0x{0:X8}" -f $i))
             }
-
 
             if ($last.ContainsKey($key)) {
-
-                $p.Spacing.Add(
-                    $i-$last[$key]
-                )
+                $p.Spacing.Add($i - $last[$key])
             }
-
-
-            $last[$key]=$i
+            $last[$key] = $i
         }
     }
 
-
-
-    $results=@()
-
-
+    $results = @()
     foreach ($key in $pairs.Keys) {
+        $p = $pairs[$key]
+        if ($p.Count -lt $MinCount) { continue }
 
-        $p=$pairs[$key]
-
-
-        if ($p.Count -lt $MinCount) {
-            continue
+        $avg = 0
+        $median = 0
+        if ($p.Spacing.Count -gt 0) {
+            $sorted = $p.Spacing | Sort-Object
+            $avg = [Math]::Round((($sorted | Measure-Object -Average).Average), 2)
+            $median = $sorted[[Math]::Floor($sorted.Count / 2)]
         }
-
-
-        $avg=0
-        $median=0
-
-
-        if ($p.Spacing.Count) {
-
-            $sorted=$p.Spacing | Sort-Object
-
-            $avg=[Math]::Round(
-                (($sorted | Measure-Object -Average).Average),
-                2
-            )
-
-            $median=$sorted[
-                [Math]::Floor($sorted.Count/2)
-            ]
-        }
-
 
         $results += [PSCustomObject]@{
-            Sequence=$key
-            Count=$p.Count
-            DistinctStreams=$p.Streams.Count
-            AvgSpacing=$avg
-            MedianSpacing=$median
-            ExampleOffsets=($p.Examples -join ", ")
+            Sequence        = $key
+            Count           = $p.Count
+            DistinctStreams = $p.Streams.Count
+            AvgSpacing      = $avg
+            MedianSpacing   = $median
+            ExampleOffsets  = ($p.Examples -join ", ")
         }
     }
 
-
-    $results |
-        Sort-Object Count -Descending |
-        Select-Object -First $MaxResults
+    return $results | Sort-Object -Property Count -Descending | Select-Object -First $MaxResults
 }
 
 Export-ModuleMember -Function `
@@ -1951,6 +1457,3 @@ Export-ModuleMember -Function `
     Find-CreoMarkerClusters, `
     Get-CreoCandidateMarkers, `
     Get-CreoMarkerPairs
-
-
-    
