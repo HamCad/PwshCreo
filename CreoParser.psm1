@@ -1115,29 +1115,23 @@ function Find-CreoStructuralRuns {
         throw "Pattern must contain complete bytes."
     }
 
-    # Utilize C# accelerator for strict nullable typing
-    $patternList = [System.Collections.Generic.List[Nullable[byte]]]::new()
-
+    $patternBytes = @()
     for ($i = 0; $i -lt $cleanPattern.Length; $i += 2) {
         $pair = $cleanPattern.Substring($i, 2)
         if ($pair -eq "??") {
-            $patternList.Add($null)
+            $patternBytes += $null
         }
         else {
-            $patternList.Add([byte][Convert]::ToInt32($pair, 16))
+            $patternBytes += [Convert]::ToByte($pair, 16)
         }
     }
 
-    # Validation Guard
-    if ($patternList.Count -eq 0) {
+    if ($patternBytes.Count -eq 0) {
         throw "Empty pattern after parsing."
     }
 
     Write-Verbose ("Searching bytes: {0}" -f (
-        ($patternList | ForEach-Object {
-            if ($null -eq $_) { "??" }
-            else { "{0:X2}" -f $_ }
-        }) -join " "
+        ($patternBytes | ForEach-Object { if ($null -eq $_) { "??" } else { "{0:X2}" -f $_ } }) -join " "
     ))
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -1146,27 +1140,24 @@ function Find-CreoStructuralRuns {
         if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
         $start = [int]$stream.PayloadStart
-        $end = $start + [int]$stream.PayloadLength - $patternList.Count
+        $end = $start + [int]$stream.PayloadLength - $patternBytes.Count
 
         for ($offset = $start; $offset -le $end; $offset++) {
             $match = $true
-            
-            # Explicitly match against the strictly typed List<Nullable<byte>>
-            for ($j = 0; $j -lt $patternList.Count; $j++) {
-                $pByte = $patternList[$j]
-                if ($null -ne $pByte -and $bytes[$offset + $j] -ne $pByte) {
+            for ($j = 0; $j -lt $patternBytes.Count; $j++) {
+                if ($null -ne $patternBytes[$j] -and $bytes[$offset + $j] -ne $patternBytes[$j]) {
                     $match = $false
                     break
                 }
             }
 
             if ($match) {
-                $slice = $bytes[$offset..($offset + $patternList.Count - 1)]
+                $slice = $bytes[$offset..($offset + $patternBytes.Count - 1)]
                 $results.Add([PSCustomObject]@{
                     Stream         = $stream.Name
                     AbsoluteOffset = ("0x{0:X8}" -f $offset)
                     RelativeOffset = ("0x{0:X8}" -f ($offset - $start))
-                    Length         = $patternList.Count
+                    Length         = $patternBytes.Count
                     MatchedBytes   = ([BitConverter]::ToString($slice) -replace "-", " ")
                 })
             }
@@ -1814,122 +1805,90 @@ function Find-CreoMarkerMotifs {
     return $results | Sort-Object -Property Count -Descending | Select-Object -First $Top
 }
 
-
-
-# ======================================================
-# Added after handoff.md update
-# Need further review
-# ======================================================
+# =========================================================================
+# FUNCTION: Get-CreoStreamSchema
+#   Walks a resolved stream's payload for the "E0 <type> <name> 00" field
+#   dictionary pattern confirmed via Get-CreoStringContext/Get-CreoMarkerValueDistribution,
+#   extracting the property name and its offsets. Property names are
+#   filtered to alnum/underscore/hash/dash to reject binary noise that
+#   happens to sit between two 0x00 bytes.
+# =========================================================================
 function Get-CreoStreamSchema {
-    <#
-    .SYNOPSIS
-        Extracts structured property schema definitions and offsets from a resolved Creo binary stream.
-    
-    .DESCRIPTION
-        Scans the byte array of a specific resolved Creo file stream for 0xE0 opcode markers, 
-        identifies type bytes, and extracts null-terminated ASCII property names along with their 
-        absolute offsets and value locations.
-    
-    .PARAMETER ResolvedStream
-        A PSCustomObject representing the resolved stream metadata, containing PayloadStart and PayloadLength.
-    
-    .PARAMETER FileBytes
-        The raw byte array of the entire resolved file ($resolved.Data).
-    
-    .OUTPUTS
-        System.Collections.Generic.List[PSCustomObject] containing Stream, AbsoluteOffset, 
-        OpcodeType, PropertyName, and ValueOffset fields.
-    
-    .EXAMPLE
-        $stream = $resolved.Streams | Where-Object Name -eq 'FullMData'
-        Get-CreoStreamSchema -ResolvedStream $stream -FileBytes $resolved.Data | Format-Table -AutoSize
-    #>
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [PSCustomObject]$ResolvedStream,
-        [byte[]]$FileBytes
+        [Parameter(Mandatory)][PSCustomObject]$ResolvedStream,
+        [Parameter(Mandatory)][byte[]]$FileBytes
     )
 
-    $streamBytes = $FileBytes[$ResolvedStream.PayloadStart..($ResolvedStream.PayloadStart + $ResolvedStream.PayloadLength - 1)]
+    if (-not (Test-CreoStreamRange $ResolvedStream $FileBytes.Length)) {
+        return @()
+    }
+
+    $streamStart = [int]$ResolvedStream.PayloadStart
+    $streamBytes = $FileBytes[$streamStart..($streamStart + [int]$ResolvedStream.PayloadLength - 1)]
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
-    
+
     $i = 0
     while ($i -lt ($streamBytes.Length - 2)) {
         if ($streamBytes[$i] -eq 0xE0) {
-            $typeByte = $streamBytes[$i+1]
+            $typeByte = $streamBytes[$i + 1]
             $stringStart = $i + 2
-            
+
             $nullIdx = $stringStart
             while ($nullIdx -lt $streamBytes.Length -and $streamBytes[$nullIdx] -ne 0x00) {
                 $nullIdx++
             }
-            
-            if ($nullIdx -lt $streamBytes.Length) {
+
+            if ($nullIdx -lt $streamBytes.Length -and $nullIdx -gt $stringStart) {
                 $propName = [System.Text.Encoding]::ASCII.GetString($streamBytes[$stringStart..($nullIdx - 1)])
-                
+
                 if ($propName -match '^[A-Za-z0-9_#-]+$') {
                     $results.Add([PSCustomObject]@{
-                        Stream          = $ResolvedStream.Name
-                        AbsoluteOffset  = $ResolvedStream.PayloadStart + $i
-                        OpcodeType      = "0xE0 {0:X2}" -f $typeByte
-                        PropertyName    = $propName
-                        ValueOffset     = $nullIdx + 1
+                        Stream         = $ResolvedStream.Name
+                        AbsoluteOffset = $streamStart + $i
+                        OpcodeType     = "0xE0 {0:X2}" -f $typeByte
+                        PropertyName   = $propName
+                        ValueOffset    = $streamStart + $nullIdx + 1
                     })
                 }
                 $i = $nullIdx
-            } else {
+            }
+            else {
                 $i++
             }
-        } else {
+        }
+        else {
             $i++
         }
     }
+
     return $results
 }
 
+# =========================================================================
+# FUNCTION: Get-CreoStreamName
+#   Lists resolved stream names for one or more files, pipeline-friendly.
+# =========================================================================
 function Get-CreoStreamName {
-    <#
-    .SYNOPSIS
-        Extracts stream names from Creo binary files.
-    
-    .DESCRIPTION
-        Accepts Creo file paths via pipeline or parameter, resolves the stream structure 
-        using Get-CreoDataMaps or internal parsing, and outputs the stream names.
-    
-    .PARAMETER Path
-        The path to one or more Creo files (e.g., .asm, .prt).
-    
-    .INPUTS
-        System.String (File paths via pipeline)
-    
-    .OUTPUTS
-        System.String (Stream names)
-    
-    .EXAMPLE
-        Get-ChildItem .\models\*.asm.1 | Get-CreoStreamName
-    #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
         [Alias('FullName', 'File')]
         [string[]]$Path
     )
 
     process {
         foreach ($file in $Path) {
-            if (-not (Test-Path $file)) {
+            if (-not (Test-Path -LiteralPath $file)) {
                 Write-Warning "File not found: $file"
                 continue
             }
 
-            # Assuming your module has Resolve-CreoFileStreams or Get-CreoDataMaps available
-            # We call the resolution logic used by your parser module
             $resolved = Resolve-CreoFileStreams -File $file
-            
             if ($resolved -and $resolved.Streams) {
                 foreach ($stream in $resolved.Streams) {
                     [PSCustomObject]@{
-                        # Path       = $file
+                        File       = $file
                         StreamName = $stream.Name
                     }
                 }
@@ -1938,87 +1897,94 @@ function Get-CreoStreamName {
     }
 }
 
-
+# =========================================================================
+# FUNCTION: Get-CreoModelStreamSchema
+#   Batch driver for Get-CreoStreamSchema across every stream in every file
+#   under -Path. Writes structured CSV (not rendered table text, which
+#   truncates long values) to -OutputFile. Only *.prt.* / *.asm.* files are
+#   scanned by default to avoid picking up this cmdlet's own prior output -
+#   the same self-scan bug that hit Invoke-CreoAnalysisPipeline.ps1 earlier.
+# =========================================================================
 function Get-CreoModelStreamSchema {
     [CmdletBinding()]
     param(
-        [Parameter(ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [Parameter(ValueFromPipeline, ValueFromPipelineByPropertyName)]
         [string[]]$Path = ".\models",
 
-        [string]$Filter = "*",
+        [string]$Filter = "*.prt.*,*.asm.*",
 
-        [string]$OutputFile = ".\models\AllStreams_Schema_Output.txt",
+        [string]$OutputFile = ".\CreoAnalysisResults\AllStreams_Schema.csv",
 
         [switch]$SummaryOnly
     )
 
     process {
+        $allResults = [System.Collections.Generic.List[object]]::new()
+
         foreach ($searchPath in $Path) {
             $targetPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($searchPath)
-            
+
             if (Test-Path -Path $targetPath -PathType Container) {
-                $files = Get-ChildItem -Path $targetPath -File -Filter $Filter
-            } elseif (Test-Path -Path $targetPath -PathType Leaf) {
+                $filters = $Filter -split ','
+                $files = foreach ($f in $filters) { Get-ChildItem -Path $targetPath -File -Filter $f.Trim() }
+                $files = $files | Sort-Object FullName -Unique
+            }
+            elseif (Test-Path -Path $targetPath -PathType Leaf) {
                 $files = Get-Item -Path $targetPath
-            } else {
+            }
+            else {
                 Write-Warning "Path not found: $targetPath"
                 continue
             }
 
-            $allResults = foreach ($file in $files) {
+            foreach ($file in $files) {
                 Write-Host "Processing file: $($file.Name)" -ForegroundColor Cyan
-                
                 $resolved = Resolve-CreoFileStreams -File $file.FullName
-                
-                if ($resolved -and $resolved.Streams) {
-                    foreach ($stream in $resolved.Streams) {
-                        Write-Host "  -> Extracting schema for stream: $($stream.Name)" -ForegroundColor DarkGray
-                        
-                        $schema = Get-CreoStreamSchema -ResolvedStream $stream -FileBytes $resolved.Data
-                        
-                        if ($schema) {
-                            if ($SummaryOnly) {
-                                [PSCustomObject]@{
-                                    File       = $file.Name
-                                    StreamName = $stream.Name
-                                    TokenCount = @($schema).Count
-                                }
-                            } else {
-                                foreach ($item in $schema) {
-                                    # Normalize Stream Name property to avoid duplicates
-                                    $sName = if ($item.StreamName) { $item.StreamName } else { $stream.Name }
-                                    
-                                    [PSCustomObject]@{
-                                        # FileName       = $file.Name
-                                        StreamName     = $sName
-                                        AbsoluteOffset = $item.AbsoluteOffset
-                                        OpcodeType     = $item.OpcodeType
-                                        PropertyName   = $item.PropertyName
-                                        ValueOffset    = $item.ValueOffset
-                                    }
-                                }
-                            }
+
+                if (-not ($resolved -and $resolved.Streams)) { continue }
+
+                foreach ($stream in $resolved.Streams) {
+                    $schema = Get-CreoStreamSchema -ResolvedStream $stream -FileBytes $resolved.Data
+                    if (-not $schema) { continue }
+
+                    if ($SummaryOnly) {
+                        $allResults.Add([PSCustomObject]@{
+                            File       = $file.Name
+                            StreamName = $stream.Name
+                            TokenCount = @($schema).Count
+                        })
+                    }
+                    else {
+                        foreach ($item in $schema) {
+                            $allResults.Add([PSCustomObject]@{
+                                File           = $file.Name
+                                StreamName     = $item.Stream
+                                AbsoluteOffset = $item.AbsoluteOffset
+                                OpcodeType     = $item.OpcodeType
+                                PropertyName   = $item.PropertyName
+                                ValueOffset    = $item.ValueOffset
+                            })
                         }
                     }
                 }
             }
-
-            if ($allResults) {
-                $outputDir = Split-Path -Parent $OutputFile
-                if ($outputDir -and -not (Test-Path $outputDir)) {
-                    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-                }
-
-                # Output clean, organized table and tee it to log
-                $allResults | Format-Table -AutoSize | Tee-Object -FilePath $OutputFile
-                Write-Host "Schema extraction complete. Output saved to: $OutputFile" -ForegroundColor Green
-            } else {
-                Write-Warning "No schema records extracted from the specified path."
-            }
         }
+
+        if ($allResults.Count -gt 0) {
+            $outputDir = Split-Path -Parent $OutputFile
+            if ($outputDir -and -not (Test-Path -LiteralPath $outputDir)) {
+                New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            }
+            $allResults | Export-Csv -Path $OutputFile -NoTypeInformation
+            Write-Host "Schema extraction complete. $($allResults.Count) rows saved to: $OutputFile" -ForegroundColor Green
+        }
+        else {
+            Write-Warning "No schema records extracted from the specified path."
+        }
+
+        return $allResults
     }
 }
-
 
 Export-ModuleMember -Function `
     Get-CreoDataMaps, `
