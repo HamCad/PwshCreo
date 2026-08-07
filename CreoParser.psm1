@@ -1986,6 +1986,101 @@ function Get-CreoModelStreamSchema {
     }
 }
 
+# =========================================================================
+# FUNCTION: Measure-CreoValueWidth
+#   For each E0-dictionary schema entry (from Get-CreoStreamSchema), measures
+#   the gap from ValueOffset to the next 0xE0 marker in the stream - i.e.
+#   how many bytes the value actually occupies before the next tag opens.
+#   Grouped by type-byte (the byte right after E0), this turns "58 distinct
+#   type-byte values" into a decode table: a type-byte whose widths cluster
+#   tightly (low StdDev, high ModePct) is very likely a fixed-width
+#   primitive (bool/int/pointer); one with a wide spread is variable-length
+#   (string/array/nested block). Empirically discovered, not assumed -
+#   same approach as everything else in this module.
+#   CAVEAT: "next E0" can be a nested marker inside the current field's own
+#   substructure, not just the next sibling field - treat single-digit
+#   widths and huge outliers within an otherwise-tight group as a sign of
+#   nesting, not a broken hypothesis.
+# =========================================================================
+function Measure-CreoValueWidth {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [byte[]]$TypeBytes,
+        [Parameter()]$ResolvedStreams
+    )
+
+    $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
+
+    $widthsByType = @{}
+    $samplesByType = @{}
+
+    foreach ($stream in $streams) {
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
+
+        $streamStart = [int]$stream.PayloadStart
+        $streamEnd = $streamStart + [int]$stream.PayloadLength - 1
+
+        $schema = Get-CreoStreamSchema -ResolvedStream $stream -FileBytes $bytes
+        if (-not $schema -or $schema.Count -eq 0) { continue }
+
+        # Precompute every 0xE0 offset in this stream once, then walk both
+        # lists (schema entries, E0 offsets) with a single advancing pointer -
+        # both are already offset-ascending, so this is O(stream length)
+        # instead of re-scanning from each entry.
+        $e0Offsets = New-Object System.Collections.Generic.List[int]
+        for ($p = $streamStart; $p -le $streamEnd; $p++) {
+            if ($bytes[$p] -eq 0xE0) { $e0Offsets.Add($p) }
+        }
+
+        $e0Idx = 0
+        foreach ($entry in $schema) {
+            $typeHex = ($entry.OpcodeType -split ' ')[1]
+            if ($TypeBytes -and ([Convert]::ToByte($typeHex, 16) -notin $TypeBytes)) { continue }
+
+            $valueStart = [int]$entry.ValueOffset
+            while ($e0Idx -lt $e0Offsets.Count -and $e0Offsets[$e0Idx] -le $valueStart) { $e0Idx++ }
+            $nextE0 = if ($e0Idx -lt $e0Offsets.Count) { $e0Offsets[$e0Idx] } else { $null }
+            $width = if ($nextE0) { $nextE0 - $valueStart } else { $streamEnd - $valueStart + 1 }
+
+            if (-not $widthsByType.ContainsKey($typeHex)) {
+                $widthsByType[$typeHex] = New-Object System.Collections.Generic.List[int]
+                $samplesByType[$typeHex] = New-Object System.Collections.Generic.List[string]
+            }
+            $widthsByType[$typeHex].Add($width)
+            if ($samplesByType[$typeHex].Count -lt 3) {
+                $samplesByType[$typeHex].Add("$($entry.Stream):$($entry.PropertyName)")
+            }
+        }
+    }
+
+    $results = foreach ($key in $widthsByType.Keys) {
+        $vals = $widthsByType[$key]
+        $sorted = $vals | Sort-Object
+        $mean = ($vals | Measure-Object -Average).Average
+        $variance = if ($vals.Count -gt 1) {
+            (($vals | ForEach-Object { [Math]::Pow($_ - $mean, 2) } | Measure-Object -Sum).Sum) / ($vals.Count - 1)
+        } else { 0 }
+        $modeGroup = $vals | Group-Object | Sort-Object Count -Descending | Select-Object -First 1
+
+        [PSCustomObject]@{
+            TypeByte      = $key
+            SampleCount   = $vals.Count
+            MinWidth      = $sorted[0]
+            MaxWidth      = $sorted[-1]
+            AvgWidth      = [Math]::Round($mean, 2)
+            MedianWidth   = $sorted[[Math]::Floor(($sorted.Count - 1) / 2)]
+            StdDev        = [Math]::Round([Math]::Sqrt($variance), 2)
+            ModeWidth     = $modeGroup.Name
+            ModePct       = [Math]::Round(100.0 * $modeGroup.Count / $vals.Count, 1)
+            ExampleFields = ($samplesByType[$key] -join ", ")
+        }
+    }
+
+    return $results | Sort-Object -Property SampleCount -Descending
+}
+
 Export-ModuleMember -Function `
     Get-CreoDataMaps, `
     Search-CreoBinaryString, `
@@ -2007,4 +2102,5 @@ Export-ModuleMember -Function `
     Find-CreoMarkerMotifs, `
     Get-CreoStreamSchema, `
     Get-CreoStreamName, `
-    Get-CreoModelStreamSchema
+    Get-CreoModelStreamSchema, `
+    Measure-CreoValueWidth
