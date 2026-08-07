@@ -273,15 +273,26 @@ function Format-HexWindow {
 # =========================================================================
 function Resolve-StreamRanges {
     param(
-        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Entries,
+        [System.Collections.Generic.List[object]]$Entries = (New-Object System.Collections.Generic.List[object]),
         [Parameter(Mandatory)][byte[]]$Data
     )
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    # Mandatory collection-typed parameters throw a binder error
+    # ("...because it is an empty collection") if handed a legitimately
+    # empty-but-non-null list - which happens on any file with zero parsed
+    # TOC entries (corrupted file, non-Creo file, etc). $Entries is
+    # deliberately optional so that case degrades to "no streams" instead
+    # of throwing.
+    if ($null -eq $Entries -or $Entries.Count -eq 0) {
+        return $rows
+    }
 
     $valid = $Entries | Where-Object { $_.OffsetVal -ne $null -and $_.OffsetVal -ge 0 -and $_.OffsetVal -lt $Data.Length }
     $sorted = $valid | Sort-Object -Property OffsetVal
 
     $prevEnd = $null
-    $rows = New-Object System.Collections.Generic.List[object]
     foreach ($e in $sorted) {
         $len = if ($e.Size1Val -and $e.Size1Val -gt 0) { $e.Size1Val } else { 0 }
         $endOff = $e.OffsetVal + $len
@@ -1104,16 +1115,30 @@ function Find-CreoStructuralRuns {
         throw "Pattern must contain complete bytes."
     }
 
-    $pattern = @()
+    # Utilize C# accelerator for strict nullable typing
+    $patternList = [System.Collections.Generic.List[Nullable[byte]]]::new()
+
     for ($i = 0; $i -lt $cleanPattern.Length; $i += 2) {
         $pair = $cleanPattern.Substring($i, 2)
         if ($pair -eq "??") {
-            $pattern += $null
+            $patternList.Add($null)
         }
         else {
-            $pattern += [Convert]::ToByte($pair, 16)
+            $patternList.Add([byte][Convert]::ToInt32($pair, 16))
         }
     }
+
+    # Validation Guard
+    if ($patternList.Count -eq 0) {
+        throw "Empty pattern after parsing."
+    }
+
+    Write-Verbose ("Searching bytes: {0}" -f (
+        ($patternList | ForEach-Object {
+            if ($null -eq $_) { "??" }
+            else { "{0:X2}" -f $_ }
+        }) -join " "
+    ))
 
     $results = [System.Collections.Generic.List[object]]::new()
 
@@ -1121,24 +1146,27 @@ function Find-CreoStructuralRuns {
         if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
 
         $start = [int]$stream.PayloadStart
-        $end = $start + [int]$stream.PayloadLength - $pattern.Count
+        $end = $start + [int]$stream.PayloadLength - $patternList.Count
 
         for ($offset = $start; $offset -le $end; $offset++) {
             $match = $true
-            for ($j = 0; $j -lt $pattern.Count; $j++) {
-                if ($null -ne $pattern[$j] -and $bytes[$offset + $j] -ne $pattern[$j]) {
+            
+            # Explicitly match against the strictly typed List<Nullable<byte>>
+            for ($j = 0; $j -lt $patternList.Count; $j++) {
+                $pByte = $patternList[$j]
+                if ($null -ne $pByte -and $bytes[$offset + $j] -ne $pByte) {
                     $match = $false
                     break
                 }
             }
 
             if ($match) {
-                $slice = $bytes[$offset..($offset + $pattern.Count - 1)]
+                $slice = $bytes[$offset..($offset + $patternList.Count - 1)]
                 $results.Add([PSCustomObject]@{
                     Stream         = $stream.Name
                     AbsoluteOffset = ("0x{0:X8}" -f $offset)
                     RelativeOffset = ("0x{0:X8}" -f ($offset - $start))
-                    Length         = $pattern.Count
+                    Length         = $patternList.Count
                     MatchedBytes   = ([BitConverter]::ToString($slice) -replace "-", " ")
                 })
             }
@@ -1443,9 +1471,559 @@ function Get-CreoMarkerPairs {
     return $results | Sort-Object -Property Count -Descending | Select-Object -First $MaxResults
 }
 
+# =========================================================================
+# FUNCTION: Test-CreoTlvHypothesis
+#   Tests whether the bytes immediately following a marker behave like a
+#   Type-Length-Value length field, rather than assuming it. For each
+#   occurrence of Marker in a resolved stream, reads -LengthBytes bytes
+#   starting -HeaderOffset bytes after the marker as a candidate length,
+#   and compares it against the ACTUAL gap to the next occurrence of that
+#   same marker in the stream. High match rate across many combinations of
+#   (LengthBytes, Endian, HeaderOffset) is evidence for a TLV-style layout;
+#   low match rate across all of them is evidence against it. Run this with
+#   a few different parameter combos per candidate marker and compare
+#   MatchRate/AvgAbsError - don't commit to "marker X is TLV" off one run.
+# =========================================================================
+function Test-CreoTlvHypothesis {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][byte]$Marker,
+        [ValidateSet(1,2,4)][int]$LengthBytes = 1,
+        [ValidateSet('LE','BE')][string]$Endian = 'LE',
+        [int]$HeaderOffset = 0,
+        [int]$Tolerance = 0,
+        [Parameter()]$ResolvedStreams
+    )
+
+    $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
+
+    $samples = New-Object System.Collections.Generic.List[object]
+
+    foreach ($stream in $streams) {
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
+
+        $start = [int]$stream.PayloadStart
+        $end = $start + [int]$stream.PayloadLength - 1
+
+        $positions = New-Object System.Collections.Generic.List[int]
+        for ($i = $start; $i -le $end; $i++) {
+            if ($bytes[$i] -eq $Marker) { $positions.Add($i) }
+        }
+        if ($positions.Count -lt 2) { continue }
+
+        for ($k = 0; $k -lt ($positions.Count - 1); $k++) {
+            $markerOffset = $positions[$k]
+            $lenStart = $markerOffset + 1 + $HeaderOffset
+
+            if (($lenStart + $LengthBytes - 1) -gt $end) { continue }
+
+            $lenBytes = $bytes[$lenStart..($lenStart + $LengthBytes - 1)]
+            if ($Endian -eq 'BE') { [array]::Reverse($lenBytes) }
+
+            $candidateLength = switch ($LengthBytes) {
+                1 { [int]$lenBytes[0] }
+                2 { [BitConverter]::ToUInt16($lenBytes, 0) }
+                4 { [BitConverter]::ToUInt32($lenBytes, 0) }
+            }
+
+            # Actual gap: from the end of the presumed length field to the next
+            # occurrence of the SAME marker in this stream. This is what the
+            # candidate length would have to predict for the TLV hypothesis to hold.
+            $valueStart = $lenStart + $LengthBytes
+            $actualGap = $positions[$k + 1] - $valueStart
+
+            $samples.Add([PSCustomObject]@{
+                Stream          = $stream.Name
+                MarkerOffset    = ("0x{0:X8}" -f $markerOffset)
+                CandidateLength = $candidateLength
+                ActualGap       = $actualGap
+                AbsError        = [Math]::Abs($candidateLength - $actualGap)
+                Match           = ([Math]::Abs($candidateLength - $actualGap) -le $Tolerance)
+            })
+        }
+    }
+
+    $matchCount = ($samples | Where-Object { $_.Match }).Count
+    $total = $samples.Count
+    $matchRate = if ($total -gt 0) { [Math]::Round(100.0 * $matchCount / $total, 1) } else { 0.0 }
+    $avgAbsError = if ($total -gt 0) { [Math]::Round((($samples | Measure-Object -Property AbsError -Average).Average), 2) } else { $null }
+
+    [PSCustomObject]@{
+        Marker          = $Marker.ToString("X2")
+        LengthBytes     = $LengthBytes
+        Endian          = $Endian
+        HeaderOffset    = $HeaderOffset
+        SampleCount     = $total
+        MatchCount      = $matchCount
+        MatchRatePct    = $matchRate
+        AvgAbsError     = $avgAbsError
+        Samples         = $samples
+    }
+}
+
+# =========================================================================
+# FUNCTION: Get-CreoStringContext
+#   For a known/recognized string, finds every occurrence inside resolved
+#   stream payloads and reports the raw hex/ASCII context around it, plus
+#   which candidate markers appear in that window and at what offset
+#   relative to the match. Complements Measure-CreoFieldBoundaries (which
+#   gives aggregate spacing stats for ALL tokens) by letting you inspect
+#   the actual bytes around specific strings you already recognize.
+# =========================================================================
+function Get-CreoStringContext {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][string[]]$SearchText,
+        [int]$ContextBytes = 24,
+        [switch]$CaseSensitive,
+        [object[]]$KnownMarkers = $script:DefaultCreoMarkers,
+        [Parameter()]$ResolvedStreams
+    )
+
+    $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    foreach ($text in $SearchText) {
+        $needle = [System.Text.Encoding]::ASCII.GetBytes($text)
+
+        foreach ($stream in $streams) {
+            if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
+
+            $start = [int]$stream.PayloadStart
+            [byte[]]$payload = $bytes[$start..($start + [int]$stream.PayloadLength - 1)]
+
+            for ($i = 0; $i -le ($payload.Length - $needle.Length); $i++) {
+                $match = $true
+                for ($j = 0; $j -lt $needle.Length; $j++) {
+                    $a = $payload[$i + $j]
+                    $b = $needle[$j]
+                    if (-not $CaseSensitive) {
+                        if ($a -ge 65 -and $a -le 90) { $a += 32 }
+                        if ($b -ge 65 -and $b -le 90) { $b += 32 }
+                    }
+                    if ($a -ne $b) { $match = $false; break }
+                }
+                if (-not $match) { continue }
+
+                $beforeStart = [Math]::Max(0, $i - $ContextBytes)
+                $before = if ($i -gt $beforeStart) { $payload[$beforeStart..($i - 1)] } else { @() }
+
+                $matchBytes = $payload[$i..($i + $needle.Length - 1)]
+
+                $afterStart = $i + $needle.Length
+                $afterEnd = [Math]::Min($payload.Length - 1, $afterStart + $ContextBytes - 1)
+                $after = if ($afterEnd -ge $afterStart) { $payload[$afterStart..$afterEnd] } else { @() }
+
+                # Flag any known candidate markers inside this window, with their
+                # offset relative to the START of the matched string (negative =
+                # before the string, positive = after).
+                $markersFound = New-Object System.Collections.Generic.List[string]
+                $windowStart = $beforeStart
+                $window = @($before) + @($matchBytes) + @($after)
+                foreach ($m in $KnownMarkers) {
+                    $mNeedle = [byte[]]$m.Bytes
+                    $offsets = Find-BytePatternOffsets -Payload $window -Needle $mNeedle
+                    foreach ($off in $offsets) {
+                        $relToMatch = ($windowStart + $off) - $i
+                        $markersFound.Add("$($m.Name)@$relToMatch")
+                    }
+                }
+
+                $results.Add([PSCustomObject]@{
+                    Stream         = $stream.Name
+                    Offset         = ("0x{0:X8}" -f ($start + $i))
+                    RelativeOffset = ("0x{0:X8}" -f $i)
+                    MatchedText    = $text
+                    BeforeHex      = ConvertTo-HexString $before
+                    MatchHex       = ConvertTo-HexString $matchBytes
+                    AfterHex       = ConvertTo-HexString $after
+                    FullAscii      = ConvertTo-AsciiString $window
+                    MarkersFound   = ($markersFound -join ", ")
+                })
+            }
+        }
+    }
+
+    return $results
+}
+
+# =========================================================================
+# FUNCTION: Get-CreoMarkerValueDistribution
+#   Tabulates the distinct values of the byte(s) immediately following a
+#   marker, with counts - a quick way to tell "type tag with a handful of
+#   enum-like values" (few distinct values, skewed counts) apart from
+#   "start of variable/free-form data" (many distinct values, flat
+#   distribution) without committing to either interpretation up front.
+# =========================================================================
+function Get-CreoMarkerValueDistribution {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][byte]$Marker,
+        [int]$ValueBytes = 1,
+        [Parameter()]$ResolvedStreams
+    )
+
+    $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
+
+    $counts = @{}
+    $total = 0
+
+    foreach ($stream in $streams) {
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
+
+        $start = [int]$stream.PayloadStart
+        $end = $start + [int]$stream.PayloadLength - 1
+
+        for ($i = $start; $i -le $end; $i++) {
+            if ($bytes[$i] -ne $Marker) { continue }
+            if (($i + $ValueBytes) -gt $end) { continue }
+
+            $valueBytesSlice = $bytes[($i + 1)..($i + $ValueBytes)]
+            $key = ConvertTo-HexString $valueBytesSlice
+
+            if (-not $counts.ContainsKey($key)) { $counts[$key] = 0 }
+            $counts[$key]++
+            $total++
+        }
+    }
+
+    $distinctCount = $counts.Keys.Count
+
+    $counts.GetEnumerator() | Sort-Object -Property Value -Descending | ForEach-Object {
+        [PSCustomObject]@{
+            Marker          = $Marker.ToString("X2")
+            FollowingValue  = $_.Key
+            Count           = $_.Value
+            PctOfOccurrences = if ($total -gt 0) { [Math]::Round(100.0 * $_.Value / $total, 1) } else { 0 }
+            DistinctValues  = $distinctCount
+            TotalOccurrences = $total
+        }
+    }
+}
+
+# =========================================================================
+# FUNCTION: Find-CreoMarkerMotifs
+#   Mines recurring MULTI-marker sequences ("motifs"), e.g. "E1 F6 E1" or
+#   "E0 01", rather than clustering a single marker byte at a time like
+#   Find-CreoMarkerClusters does. Walks only the positions of candidate
+#   marker bytes (ignoring literal string/value bytes in between), groups
+#   nearby marker occurrences into runs (gap <= MaxGap), then extracts and
+#   tallies every sliding sub-sequence of length MinMotifLength..
+#   MaxMotifLength within each run. A motif with a high count and low
+#   DistinctStreams-to-Count ratio (concentrated rather than spread thin)
+#   is a strong candidate for a genuine fixed marker sequence rather than
+#   coincidental adjacency.
+# =========================================================================
+function Find-CreoMarkerMotifs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$File,
+        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF),
+        [int]$MaxGap = 3,
+        [int]$MinMotifLength = 2,
+        [int]$MaxMotifLength = 4,
+        [int]$Top = 30,
+        [Parameter()]$ResolvedStreams
+    )
+
+    $streams = Resolve-CreoStreamsNormalized -File $File -ResolvedStreams $ResolvedStreams
+    $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $File))
+
+    $markerSet = New-Object 'System.Collections.Generic.HashSet[byte]'
+    foreach ($m in $MarkerBytes) { [void]$markerSet.Add([byte]$m) }
+
+    $motifs = @{}
+
+    function _AddMotif {
+        param([byte[]]$Seq, [string]$StreamName, [int]$Offset)
+
+        $key = ConvertTo-HexString $Seq
+        if (-not $motifs.ContainsKey($key)) {
+            $motifs[$key] = @{
+                Count    = 0
+                Streams  = [System.Collections.Generic.HashSet[string]]::new()
+                Examples = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        $motifs[$key].Count++
+        [void]$motifs[$key].Streams.Add($StreamName)
+        if ($motifs[$key].Examples.Count -lt 3) {
+            $motifs[$key].Examples.Add(("0x{0:X8}" -f $Offset))
+        }
+    }
+
+    foreach ($stream in $streams) {
+        if (-not (Test-CreoStreamRange $stream $bytes.Length)) { continue }
+
+        $start = [int]$stream.PayloadStart
+        $end = $start + [int]$stream.PayloadLength - 1
+
+        $events = New-Object System.Collections.Generic.List[int]
+        for ($i = $start; $i -le $end; $i++) {
+            if ($markerSet.Contains($bytes[$i])) { $events.Add($i) }
+        }
+        if ($events.Count -lt $MinMotifLength) { continue }
+
+        $runStart = 0
+        for ($idx = 1; $idx -le $events.Count; $idx++) {
+            $isLast = ($idx -eq $events.Count)
+            $gapExceeded = $false
+            if (-not $isLast) {
+                $gapExceeded = ($events[$idx] - $events[$idx - 1]) -gt $MaxGap
+            }
+
+            if ($isLast -or $gapExceeded) {
+                $runEvents = $events.GetRange($runStart, $idx - $runStart)
+
+                if ($runEvents.Count -ge $MinMotifLength) {
+                    $maxWin = [Math]::Min($MaxMotifLength, $runEvents.Count)
+                    for ($winLen = $MinMotifLength; $winLen -le $maxWin; $winLen++) {
+                        for ($w = 0; $w -le ($runEvents.Count - $winLen); $w++) {
+                            $seqOffsets = $runEvents.GetRange($w, $winLen)
+                            $seqBytes = [byte[]]::new($winLen)
+                            for ($z = 0; $z -lt $winLen; $z++) {
+                                $seqBytes[$z] = $bytes[$seqOffsets[$z]]
+                            }
+                            _AddMotif -Seq $seqBytes -StreamName $stream.Name -Offset $seqOffsets[0]
+                        }
+                    }
+                }
+
+                $runStart = $idx
+            }
+        }
+    }
+
+    $results = foreach ($key in $motifs.Keys) {
+        $m = $motifs[$key]
+        [PSCustomObject]@{
+            Motif           = $key
+            Count           = $m.Count
+            DistinctStreams = $m.Streams.Count
+            ExampleOffsets  = ($m.Examples -join ", ")
+        }
+    }
+
+    return $results | Sort-Object -Property Count -Descending | Select-Object -First $Top
+}
+
+
+
+# ======================================================
+# Added after handoff.md update
+# Need further review
+# ======================================================
+function Get-CreoStreamSchema {
+    <#
+    .SYNOPSIS
+        Extracts structured property schema definitions and offsets from a resolved Creo binary stream.
+    
+    .DESCRIPTION
+        Scans the byte array of a specific resolved Creo file stream for 0xE0 opcode markers, 
+        identifies type bytes, and extracts null-terminated ASCII property names along with their 
+        absolute offsets and value locations.
+    
+    .PARAMETER ResolvedStream
+        A PSCustomObject representing the resolved stream metadata, containing PayloadStart and PayloadLength.
+    
+    .PARAMETER FileBytes
+        The raw byte array of the entire resolved file ($resolved.Data).
+    
+    .OUTPUTS
+        System.Collections.Generic.List[PSCustomObject] containing Stream, AbsoluteOffset, 
+        OpcodeType, PropertyName, and ValueOffset fields.
+    
+    .EXAMPLE
+        $stream = $resolved.Streams | Where-Object Name -eq 'FullMData'
+        Get-CreoStreamSchema -ResolvedStream $stream -FileBytes $resolved.Data | Format-Table -AutoSize
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [PSCustomObject]$ResolvedStream,
+        [byte[]]$FileBytes
+    )
+
+    $streamBytes = $FileBytes[$ResolvedStream.PayloadStart..($ResolvedStream.PayloadStart + $ResolvedStream.PayloadLength - 1)]
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    
+    $i = 0
+    while ($i -lt ($streamBytes.Length - 2)) {
+        if ($streamBytes[$i] -eq 0xE0) {
+            $typeByte = $streamBytes[$i+1]
+            $stringStart = $i + 2
+            
+            $nullIdx = $stringStart
+            while ($nullIdx -lt $streamBytes.Length -and $streamBytes[$nullIdx] -ne 0x00) {
+                $nullIdx++
+            }
+            
+            if ($nullIdx -lt $streamBytes.Length) {
+                $propName = [System.Text.Encoding]::ASCII.GetString($streamBytes[$stringStart..($nullIdx - 1)])
+                
+                if ($propName -match '^[A-Za-z0-9_#-]+$') {
+                    $results.Add([PSCustomObject]@{
+                        Stream          = $ResolvedStream.Name
+                        AbsoluteOffset  = $ResolvedStream.PayloadStart + $i
+                        OpcodeType      = "0xE0 {0:X2}" -f $typeByte
+                        PropertyName    = $propName
+                        ValueOffset     = $nullIdx + 1
+                    })
+                }
+                $i = $nullIdx
+            } else {
+                $i++
+            }
+        } else {
+            $i++
+        }
+    }
+    return $results
+}
+
+function Get-CreoStreamName {
+    <#
+    .SYNOPSIS
+        Extracts stream names from Creo binary files.
+    
+    .DESCRIPTION
+        Accepts Creo file paths via pipeline or parameter, resolves the stream structure 
+        using Get-CreoDataMaps or internal parsing, and outputs the stream names.
+    
+    .PARAMETER Path
+        The path to one or more Creo files (e.g., .asm, .prt).
+    
+    .INPUTS
+        System.String (File paths via pipeline)
+    
+    .OUTPUTS
+        System.String (Stream names)
+    
+    .EXAMPLE
+        Get-ChildItem .\models\*.asm.1 | Get-CreoStreamName
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [Alias('FullName', 'File')]
+        [string[]]$Path
+    )
+
+    process {
+        foreach ($file in $Path) {
+            if (-not (Test-Path $file)) {
+                Write-Warning "File not found: $file"
+                continue
+            }
+
+            # Assuming your module has Resolve-CreoFileStreams or Get-CreoDataMaps available
+            # We call the resolution logic used by your parser module
+            $resolved = Resolve-CreoFileStreams -File $file
+            
+            if ($resolved -and $resolved.Streams) {
+                foreach ($stream in $resolved.Streams) {
+                    [PSCustomObject]@{
+                        # Path       = $file
+                        StreamName = $stream.Name
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+function Get-CreoModelStreamSchema {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [string[]]$Path = ".\models",
+
+        [string]$Filter = "*",
+
+        [string]$OutputFile = ".\models\AllStreams_Schema_Output.txt",
+
+        [switch]$SummaryOnly
+    )
+
+    process {
+        foreach ($searchPath in $Path) {
+            $targetPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($searchPath)
+            
+            if (Test-Path -Path $targetPath -PathType Container) {
+                $files = Get-ChildItem -Path $targetPath -File -Filter $Filter
+            } elseif (Test-Path -Path $targetPath -PathType Leaf) {
+                $files = Get-Item -Path $targetPath
+            } else {
+                Write-Warning "Path not found: $targetPath"
+                continue
+            }
+
+            $allResults = foreach ($file in $files) {
+                Write-Host "Processing file: $($file.Name)" -ForegroundColor Cyan
+                
+                $resolved = Resolve-CreoFileStreams -File $file.FullName
+                
+                if ($resolved -and $resolved.Streams) {
+                    foreach ($stream in $resolved.Streams) {
+                        Write-Host "  -> Extracting schema for stream: $($stream.Name)" -ForegroundColor DarkGray
+                        
+                        $schema = Get-CreoStreamSchema -ResolvedStream $stream -FileBytes $resolved.Data
+                        
+                        if ($schema) {
+                            if ($SummaryOnly) {
+                                [PSCustomObject]@{
+                                    File       = $file.Name
+                                    StreamName = $stream.Name
+                                    TokenCount = @($schema).Count
+                                }
+                            } else {
+                                foreach ($item in $schema) {
+                                    # Normalize Stream Name property to avoid duplicates
+                                    $sName = if ($item.StreamName) { $item.StreamName } else { $stream.Name }
+                                    
+                                    [PSCustomObject]@{
+                                        # FileName       = $file.Name
+                                        StreamName     = $sName
+                                        AbsoluteOffset = $item.AbsoluteOffset
+                                        OpcodeType     = $item.OpcodeType
+                                        PropertyName   = $item.PropertyName
+                                        ValueOffset    = $item.ValueOffset
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ($allResults) {
+                $outputDir = Split-Path -Parent $OutputFile
+                if ($outputDir -and -not (Test-Path $outputDir)) {
+                    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+                }
+
+                # Output clean, organized table and tee it to log
+                $allResults | Format-Table -AutoSize | Tee-Object -FilePath $OutputFile
+                Write-Host "Schema extraction complete. Output saved to: $OutputFile" -ForegroundColor Green
+            } else {
+                Write-Warning "No schema records extracted from the specified path."
+            }
+        }
+    }
+}
+
+
 Export-ModuleMember -Function `
     Get-CreoDataMaps, `
     Search-CreoBinaryString, `
+    Resolve-CreoFileStreams, `
     Get-CreoMarkerStatistics, `
     Find-CreoMarkerSequence, `
     Measure-CreoFieldBoundaries, `
@@ -1456,4 +2034,11 @@ Export-ModuleMember -Function `
     Measure-CreoEntropyRegions, `
     Find-CreoMarkerClusters, `
     Get-CreoCandidateMarkers, `
-    Get-CreoMarkerPairs
+    Get-CreoMarkerPairs, `
+    Test-CreoTlvHypothesis, `
+    Get-CreoStringContext, `
+    Get-CreoMarkerValueDistribution, `
+    Find-CreoMarkerMotifs, `
+    Get-CreoStreamSchema, `
+    Get-CreoStreamName, `
+    Get-CreoModelStreamSchema
