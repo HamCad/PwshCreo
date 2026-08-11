@@ -205,7 +205,7 @@ public static class CreoNative {
             // the next parameter frame's own header bytes, and landed on
             // the NEXT parameter's name - reporting it as this parameter's
             // value. Confirmed via REFERENCE_3..REFERENCE_6 in
-            // start-assembly.asm.1 (all empty; old code reported REFERENCE_3's
+            // company_start_asm.asm.1 (all empty; old code reported REFERENCE_3's
             // value as "REFERENCE_4", REFERENCE_5's as "REFERENCE_6", etc).
             // Each type now reads its own value directly from valueStart.
             if (valueStart < bytes.Length) {
@@ -2102,7 +2102,7 @@ function Get-CreoParametersFromPayloadPS {
         # empty string, but the old scan walked past it, through the next
         # parameter frame's own header bytes, and landed on the NEXT
         # parameter's name - reporting it as this parameter's value.
-        # Confirmed via REFERENCE_3..REFERENCE_6 in start-assembly.asm.1 (all
+        # Confirmed via REFERENCE_3..REFERENCE_6 in company_start_asm.asm.1 (all
         # empty; old code reported REFERENCE_3's value as "REFERENCE_4",
         # REFERENCE_5's as "REFERENCE_6", etc). Mirrors the C# fix exactly.
         if ($valueStart -lt $Payload.Length) {
@@ -2201,7 +2201,283 @@ function Get-CreoParameter {
     }
 }
 
+# =========================================================================
+# FUNCTION: Compare-CreoStreamBytes
+#   Byte-level diff of ONE named stream between two files (typically a
+#   resave pair - same file before/after a specific edit). Finds the first
+#   offset where the two payloads diverge and shows raw hex/ASCII on both
+#   sides from that point. Built specifically for the resave-pair workflow:
+#   Compare-CreoStreams tells you WHICH stream changed and by how much;
+#   this tells you WHAT changed, byte for byte.
+# =========================================================================
+function Compare-CreoStreamBytes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Before,
+        [Parameter(Mandatory)][string]$After,
+        [Parameter(Mandatory)][string]$StreamName,
+        [int]$ContextBytes = 32,
+        [int]$ShowBytes = 96
+    )
+
+    $rBefore = Resolve-CreoFileStreams -Path $Before
+    $rAfter  = Resolve-CreoFileStreams -Path $After
+
+    $sBefore = $rBefore.Streams | Where-Object { $_.Name -eq $StreamName } | Select-Object -First 1
+    $sAfter  = $rAfter.Streams  | Where-Object { $_.Name -eq $StreamName } | Select-Object -First 1
+
+    if (-not $sBefore -or -not $sAfter) {
+        throw "Stream '$StreamName' not found in one or both files (Before: $([bool]$sBefore), After: $([bool]$sAfter)). Run Get-CreoStreamName to check the exact name."
+    }
+
+    $bytesBefore = $rBefore.Data[$sBefore.PayloadStart..($sBefore.PayloadStart + $sBefore.PayloadLength - 1)]
+    $bytesAfter  = $rAfter.Data[$sAfter.PayloadStart..($sAfter.PayloadStart + $sAfter.PayloadLength - 1)]
+
+    $minLen = [Math]::Min($bytesBefore.Length, $bytesAfter.Length)
+    $divergeAt = $minLen
+    for ($i = 0; $i -lt $minLen; $i++) {
+        if ($bytesBefore[$i] -ne $bytesAfter[$i]) { $divergeAt = $i; break }
+    }
+
+    if ($divergeAt -eq $minLen -and $bytesBefore.Length -eq $bytesAfter.Length) {
+        return [PSCustomObject]@{
+            StreamName   = $StreamName
+            Identical    = $true
+            LengthBefore = $bytesBefore.Length
+            LengthAfter  = $bytesAfter.Length
+            Detail       = "Byte-for-byte identical - no change in this stream between these two files."
+        }
+    }
+
+    $ctxStart = [Math]::Max(0, $divergeAt - $ContextBytes)
+    $commonTail = if ($divergeAt -gt $ctxStart) { $bytesBefore[$ctxStart..($divergeAt - 1)] } else { @() }
+
+    $newInBefore = if ($divergeAt -lt $bytesBefore.Length) {
+        $endIdx = [Math]::Min($bytesBefore.Length, $divergeAt + $ShowBytes) - 1
+        $bytesBefore[$divergeAt..$endIdx]
+    } else { @() }
+
+    $newInAfter = if ($divergeAt -lt $bytesAfter.Length) {
+        $endIdx = [Math]::Min($bytesAfter.Length, $divergeAt + $ShowBytes) - 1
+        $bytesAfter[$divergeAt..$endIdx]
+    } else { @() }
+
+    [PSCustomObject]@{
+        StreamName       = $StreamName
+        Identical        = $false
+        LengthBefore     = $bytesBefore.Length
+        LengthAfter      = $bytesAfter.Length
+        LengthDelta      = $bytesAfter.Length - $bytesBefore.Length
+        DivergesAt       = ("0x{0:X8}" -f $divergeAt)
+        DivergesAtAbsBefore = ("0x{0:X8}" -f ($sBefore.PayloadStart + $divergeAt))
+        DivergesAtAbsAfter  = ("0x{0:X8}" -f ($sAfter.PayloadStart + $divergeAt))
+        CommonContext    = ConvertTo-HexString $commonTail
+        BeforeHex        = ConvertTo-HexString $newInBefore
+        BeforeAscii      = ConvertTo-AsciiString $newInBefore
+        AfterHex         = ConvertTo-HexString $newInAfter
+        AfterAscii       = ConvertTo-AsciiString $newInAfter
+    }
+}
+
+# =========================================================================
+# FUNCTION: Show-CreoHexDump
+#   Console-only (Write-Host, not pipeline output) colorized hex dump.
+#   Yellow = candidate marker byte (E0-E7/F6-FF family), Green = printable
+#   ASCII, DarkGray = null, White = everything else.
+#   -Offset is ALWAYS an absolute file offset - the same kind of value
+#   every other command in this module reports (AbsoluteOffset, OffsetHex,
+#   DivergesAtAbsBefore/After, etc). Paste any of those straight in here,
+#   no relative-vs-absolute conversion needed. -StreamName is purely a
+#   convenience: if you omit -Offset, it starts you at the beginning of
+#   that stream instead of byte 0 of the file.
+# =========================================================================
+function Show-CreoHexDump {
+    [CmdletBinding(DefaultParameterSetName = 'File')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'File')]
+        [string]$Path,
+
+        [Parameter(ParameterSetName = 'File')]
+        [string]$StreamName,
+
+        [Parameter(ParameterSetName = 'File')]
+        [int]$Offset = 0,
+
+        [Parameter(Mandatory, ParameterSetName = 'Bytes')]
+        [byte[]]$Bytes,
+        [Parameter(ParameterSetName = 'Bytes')]
+        [int]$BaseOffset = 0,
+
+        [int]$Length = 256,
+        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
+    )
+
+    $markerSet = New-Object 'System.Collections.Generic.HashSet[byte]'
+    foreach ($m in $MarkerBytes) { [void]$markerSet.Add([byte]$m) }
+
+    if ($PSCmdlet.ParameterSetName -eq 'File') {
+        if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path" }
+        $all = [System.IO.File]::ReadAllBytes((Resolve-Path $Path))
+
+        $start = $Offset
+        if (-not $PSBoundParameters.ContainsKey('Offset') -and $StreamName) {
+            $resolved = Resolve-CreoFileStreams -Path $Path
+            $stream = $resolved.Streams | Where-Object { $_.Name -eq $StreamName } | Select-Object -First 1
+            if (-not $stream) { throw "Stream '$StreamName' not found. Run Get-CreoStreamName -Path '$Path' to see what's available." }
+            $start = [int]$stream.PayloadStart
+        }
+
+        $start = [Math]::Max(0, $start)
+        $end = [Math]::Min($all.Length, $start + $Length)
+        if ($start -ge $end) { throw "Offset 0x$($start.ToString('X8')) is outside the file (file is $($all.Length) bytes)." }
+        $data = $all[$start..($end - 1)]
+        $base = $start
+    }
+    else {
+        $data = $Bytes
+        $base = $BaseOffset
+    }
+
+    Write-Host ""
+    Write-Host "Marker" -ForegroundColor Yellow -NoNewline
+    Write-Host "   " -NoNewline
+    Write-Host "Printable" -ForegroundColor Green -NoNewline
+    Write-Host "   " -NoNewline
+    Write-Host "Null" -ForegroundColor DarkGray -NoNewline
+    Write-Host "   " -NoNewline
+    Write-Host "Other" -ForegroundColor White
+    Write-Host ""
+
+    for ($row = 0; $row -lt $data.Length; $row += 16) {
+        $rowEnd = [Math]::Min($row + 15, $data.Length - 1)
+        Write-Host ("{0:X8}  " -f ($base + $row)) -NoNewline -ForegroundColor Cyan
+
+        for ($i = $row; $i -le ($row + 15); $i++) {
+            if ($i -gt $rowEnd) { Write-Host "   " -NoNewline; continue }
+            $b = $data[$i]
+            $color = if ($markerSet.Contains($b)) { "Yellow" }
+                     elseif ($b -eq 0x00) { "DarkGray" }
+                     elseif ($b -ge 0x20 -and $b -le 0x7E) { "Green" }
+                     else { "White" }
+            Write-Host ("{0:X2} " -f $b) -NoNewline -ForegroundColor $color
+        }
+
+        Write-Host " |" -NoNewline
+        for ($i = $row; $i -le $rowEnd; $i++) {
+            $b = $data[$i]
+            $color = if ($markerSet.Contains($b)) { "Yellow" }
+                     elseif ($b -eq 0x00) { "DarkGray" }
+                     elseif ($b -ge 0x20 -and $b -le 0x7E) { "Green" }
+                     else { "White" }
+            $ch = if ($b -ge 0x20 -and $b -le 0x7E) { [char]$b } else { '.' }
+            Write-Host $ch -NoNewline -ForegroundColor $color
+        }
+        Write-Host "|"
+    }
+    Write-Host ""
+}
+
+# =========================================================================
+# FUNCTION: Export-CreoThumbnail
+#   Extracts the embedded JPEG thumbnail from THMB_IMG_MAIN. Locates the
+#   JPEG SOI/EOI markers (FF D8 / FF D9) inside the stream rather than
+#   assuming a fixed offset, so this works on any file regardless of how
+#   much header overhead precedes the actual image bytes - generalizes the
+#   approach the user found by hand on prt0001.prt.1.
+#   NOTE: searches the stream's full RAW TOC-declared range (OffsetVal to
+#   EndOffset), not the overhead-stripped PayloadStart/PayloadLength. The
+#   overhead-stripping formula this module uses elsewhere assumes the
+#   "#ND:0:<Name>:<n>" echo-tag pattern, tuned for name/value dictionary
+#   streams - it doesn't reliably apply to an embedded binary image, and
+#   was clipping into the actual JPEG bytes on real files.
+# =========================================================================
+function Export-CreoThumbnail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias("FullName")]
+        [string[]]$Path,
+
+        [string]$OutputDirectory,
+        [switch]$PassThru
+    )
+
+    process {
+        foreach ($filePath in $Path) {
+            $resolvedPaths = Resolve-Path -Path $filePath -ErrorAction SilentlyContinue
+            foreach ($rp in $resolvedPaths) {
+                $fileInfo = [System.IO.FileInfo]::new($rp.Path)
+                if (-not $fileInfo.Exists) { continue }
+
+                $resolved = Resolve-CreoFileStreams -Path $fileInfo.FullName
+                $stream = $resolved.Streams | Where-Object { $_.Name -eq "THMB_IMG_MAIN" } | Select-Object -First 1
+
+                if (-not $stream) {
+                    Write-Warning "$($fileInfo.Name): no THMB_IMG_MAIN stream found."
+                    continue
+                }
+
+                $rawStart = [int]$stream.OffsetVal
+                $rawEnd = [int]$stream.EndOffset
+                if ($rawEnd -gt $resolved.Data.Length) { $rawEnd = $resolved.Data.Length }
+                if ($rawStart -ge $rawEnd) {
+                    Write-Warning "$($fileInfo.Name): THMB_IMG_MAIN has no usable byte range."
+                    continue
+                }
+                $payload = $resolved.Data[$rawStart..($rawEnd - 1)]
+
+                $soiOffsets = Find-BytePatternOffsets -Payload $payload -Needle ([byte[]](0xFF, 0xD8))
+                if ($soiOffsets.Count -eq 0) {
+                    Write-Warning "$($fileInfo.Name): THMB_IMG_MAIN found but no JPEG SOI (FF D8) inside it - may not have a cached thumbnail, or uses a different image format."
+                    continue
+                }
+
+                # Try each SOI candidate in order until one has a matching EOI -
+                # guards against a coincidental FF D8 in header bytes that
+                # isn't the real image start.
+                $jpegStart = $null
+                $eoiOffset = -1
+                foreach ($candidateStart in $soiOffsets) {
+                    for ($i = $candidateStart + 2; $i -lt ($payload.Length - 1); $i++) {
+                        if ($payload[$i] -eq 0xFF -and $payload[$i + 1] -eq 0xD9) {
+                            $jpegStart = $candidateStart
+                            $eoiOffset = $i + 1
+                            break
+                        }
+                    }
+                    if ($eoiOffset -ge 0) { break }
+                }
+
+                if ($null -eq $jpegStart) {
+                    Write-Warning "$($fileInfo.Name): found $($soiOffsets.Count) JPEG SOI candidate(s) in THMB_IMG_MAIN but none had a matching EOI (FF D9) - possibly truncated, or not actually a JPEG."
+                    continue
+                }
+
+                $jpegBytes = $payload[$jpegStart..$eoiOffset]
+
+                $outDir = if ($OutputDirectory) { $OutputDirectory } else { $fileInfo.DirectoryName }
+                if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+                $outPath = Join-Path $outDir "$($fileInfo.Name)_thumbnail.jpg"
+
+                [System.IO.File]::WriteAllBytes($outPath, $jpegBytes)
+
+                $result = [PSCustomObject]@{
+                    File         = $fileInfo.Name
+                    OutputPath   = $outPath
+                    JpegStartAbs = ("0x{0:X8}" -f ($rawStart + $jpegStart))
+                    JpegEndAbs   = ("0x{0:X8}" -f ($rawStart + $eoiOffset))
+                    Length       = $jpegBytes.Length
+                }
+                if ($PassThru) { $result } else { Write-Host "Saved: $outPath ($($jpegBytes.Length) bytes)" -ForegroundColor Green }
+            }
+        }
+    }
+}
+
 Export-ModuleMember -Function `
+    Export-CreoThumbnail, `
+    Compare-CreoStreamBytes, `
+    Show-CreoHexDump, `
     Get-CreoDataMaps, `
     Search-CreoBinaryString, `
     Resolve-CreoFileStreams, `
