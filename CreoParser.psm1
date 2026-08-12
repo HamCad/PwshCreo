@@ -404,7 +404,10 @@ function Get-PrintableStrings {
 # =========================================================================
 function Parse-TocEntries {
     param(
-        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Strings,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Strings,
+
         [int]$MinFields = 8
     )
 
@@ -415,6 +418,10 @@ function Parse-TocEntries {
 
     # Trailing '#' padding is stripped before tokenizing.
     foreach ($s in $Strings) {
+        if ($null -eq $s) {
+            continue
+        }
+
         $val = $s.Value.TrimEnd('#').TrimEnd()
 
         if ($val -match '^#UGC_TOC\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
@@ -781,7 +788,7 @@ function Resolve-CreoFileStreams {
     # Original single-file behavior.
     [byte[]]$Data = [System.IO.File]::ReadAllBytes($item.FullName)
 
-    $strings = Get-PrintableStrings -Data $Data -MinLen 6
+    $strings = @(Get-PrintableStrings -Data $Data -MinLen 6)
     $parsed  = Parse-TocEntries -Strings $strings -MinFields 8
     $streams = Resolve-StreamRanges -Entries $parsed.Entries -Data $Data
 
@@ -2614,6 +2621,129 @@ function Extract-CreoThumbnail {
     }
 }
 
+
+
+# =========================================================================
+# FUNCTION: ConvertTo-CreoByteArray:
+#   One reusable converter function, then have every public function accept
+#   marker/search-byte input as [object] rather than [byte[]]
+#   
+#   " E3F74133 "
+#   "E3 F7 41 33"
+#   "E3, F7, 41, 33"
+#   "0xE3 0xF7 0x41 0x33"
+#   [byte[]](0xE3, 0xF7, 0x41, 0x33)
+#   @(0xE3, 0xF7, 0x41, 0x33)
+# =========================================================================
+function ConvertTo-CreoByteArray {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object]$InputObject
+    )
+
+    if ($null -eq $InputObject) {
+        throw "Byte input cannot be null."
+    }
+
+    # Already exactly what we need.
+    if ($InputObject -is [byte[]]) {
+        return $InputObject
+    }
+
+    # A hex string, such as:
+    # E3F74133
+    # E3 F7 41 33
+    # E3, F7, 41, 33
+    # 0xE3 0xF7 0x41 0x33
+    if ($InputObject -is [string]) {
+        $text = $InputObject.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            throw "Byte input cannot be empty."
+        }
+
+        # One uninterrupted hex string: E3F74133
+        if ($text -match '^[0-9A-Fa-f]+$') {
+            if (($text.Length % 2) -ne 0) {
+                throw (
+                    "Hex input must contain complete byte pairs. " +
+                    "Received $($text.Length) hex characters: '$InputObject'."
+                )
+            }
+
+            $bytes = New-Object byte[] ($text.Length / 2)
+
+            for ($i = 0; $i -lt $bytes.Length; $i++) {
+                $pair = $text.Substring($i * 2, 2)
+                $bytes[$i] = [Convert]::ToByte($pair, 16)
+            }
+
+            return $bytes
+        }
+
+        # Delimited byte values: E3 F7 41 33, 0xE3,0xF7, etc.
+        $tokens = $text -split '[\s,;:\-]+' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        if ($tokens.Count -eq 0) {
+            throw "No byte values were found in '$InputObject'."
+        }
+
+        $bytes = New-Object System.Collections.Generic.List[byte]
+
+        foreach ($token in $tokens) {
+            $hex = $token -replace '^(?i:0x)', ''
+
+            if ($hex -notmatch '^[0-9A-Fa-f]{2}$') {
+                throw (
+                    "Invalid byte token '$token'. Expected exactly two hex digits, " +
+                    "such as E3 or 0xE3."
+                )
+            }
+
+            $bytes.Add([Convert]::ToByte($hex, 16))
+        }
+
+        return $bytes.ToArray()
+    }
+
+    # Handles normal numeric arrays, such as @(0xE3, 0xF7, 0x41, 0x33).
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        $bytes = New-Object System.Collections.Generic.List[byte]
+
+        foreach ($value in $InputObject) {
+            if ($null -eq $value) {
+                throw "Byte input contains a null value."
+            }
+
+            try {
+                $bytes.Add([Convert]::ToByte($value))
+            }
+            catch {
+                throw "Cannot convert '$value' to a byte. Valid decimal values are 0 through 255."
+            }
+        }
+
+        if ($bytes.Count -eq 0) {
+            throw "Byte input cannot be empty."
+        }
+
+        return $bytes.ToArray()
+    }
+
+    # Supports a single numeric byte-like value.
+    try {
+        return [byte[]]@([Convert]::ToByte($InputObject))
+    }
+    catch {
+        throw "Cannot convert '$InputObject' to a byte array."
+    }
+}
+
+
+
 # =========================================================================
 # FUNCTION: Search-CreoBinary:
 #   It uses Parameter Sets to automatically adapt to what you hand it, 
@@ -2937,6 +3067,91 @@ function Invoke-CreoRegionAnalysis {
 }
 
 
+# =========================================================================
+# FUNCTION: Export-CreoRegionBlob (The Carver):
+#   Once Invoke-CreoRegionAnalysis flags a highly volatile or high-entropy
+#   region (like the SolidPersistTable block), you don't want to keep 
+#   analyzing it in the context of the entire multi-megabyte .prt file. 
+#   You need to carve out that exact chunk of raw bytes.
+# =========================================================================
+function Export-CreoRegionBlob {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
+        [object]$RegionSnapshot,
+
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationPath,
+
+        [Parameter(Mandatory=$false)]
+        [int]$Padding = 32
+    )
+    process {
+        # Assuming $RegionSnapshot contains AbsoluteOffset and Length from your search
+        $startOffset = [math]::Max(0, $RegionSnapshot.AbsoluteOffset - $Padding)
+        $extractLength = $RegionSnapshot.Length + ($Padding * 2)
+
+        # Grab the raw bytes using your existing stream resolvers
+        $rawBytes = Get-CreoStreamBytes -Path $RegionSnapshot.FilePath -Offset $startOffset -Length $extractLength
+        
+        $outFile = Join-Path -Path $DestinationPath -ChildPath "$($RegionSnapshot.StreamName)_$($RegionSnapshot.AbsoluteOffset).bin"
+        [System.IO.File]::WriteAllBytes($outFile, $rawBytes)
+
+        Write-Output [PSCustomObject]@{
+            ExtractedFile = $outFile
+            OriginalOffset = $RegionSnapshot.AbsoluteOffset
+            BytesWritten = $rawBytes.Length
+        }
+    }
+}
+
+
+
+# =========================================================================
+# FUNCTION: Trace-CreoPointerReference (The XREF Tracker): 
+#   Since we now know that the E0 markers are dynamically assigning 4-byte
+#   IDs (like E3 F7 41 33), finding the declaration is only half the battle. 
+#   You need a cmdlet that takes the ID found in the snapshot and sweeps the
+#   rest of the parsed file streams to build a cross-reference (XREF) map 
+#   of everywhere that specific ID is invoked.
+# =========================================================================
+function Trace-CreoPointerReference {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
+        [object]$RegionSnapshot,
+
+        [Parameter(Mandatory=$false)]
+        [switch]$IncludeColorDump
+    )
+    process {
+        # Extract the dynamic 4-byte ID discovered in the snapshot
+        $dynamicId = $RegionSnapshot.DiscoveredIdBytes 
+        
+        # Search all streams in the current file for this exact byte sequence
+        $xrefs = Find-CreoStructuralRuns -Path $RegionSnapshot.FilePath -Pattern $dynamicId
+        
+        foreach ($ref in $xrefs) {
+            $result = [PSCustomObject]@{
+                TargetStream   = $ref.StreamName
+                TargetOffset   = $ref.AbsoluteOffset
+                SourceSchema   = $RegionSnapshot.SchemaName
+                DynamicID      = $dynamicId
+            }
+
+            if ($IncludeColorDump) {
+                # Pipe into your existing hex dump for immediate visual context
+                Show-CreoHexDump -Path $RegionSnapshot.FilePath -Offset $ref.AbsoluteOffset -Length 64
+            }
+
+            Write-Output $result
+        }
+    }
+}
+
+
+
+
 Export-ModuleMember -Function `
     Export-CreoThumbnail, `
     Extract-CreoThumbnail, `
@@ -2967,4 +3182,6 @@ Export-ModuleMember -Function `
     Find-CreoString, `
     Get-CreoParameter,`
     Search-CreoBinary,`
-    Invoke-CreoRegionAnalysis
+    Invoke-CreoRegionAnalysis, `
+    Trace-CreoPointerReference, `
+    Export-CreoRegionBlob
