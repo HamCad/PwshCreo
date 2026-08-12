@@ -732,21 +732,66 @@ function ConvertTo-AsciiString {
     return (($Bytes | ForEach-Object { if ($_ -ge 32 -and $_ -le 126) { [char]$_ } else { '.' } }) -join '')
 }
 
+# function Resolve-CreoFileStreams {
+#     param([Parameter(Mandatory)][string]$Path)
+# 
+#     if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path" }
+# 
+#     [byte[]]$Data = [System.IO.File]::ReadAllBytes((Resolve-Path $Path))
+#     $strings = Get-PrintableStrings -Data $Data -MinLen 6
+#     $parsed  = Parse-TocEntries -Strings $strings -MinFields 8
+#     $streams = Resolve-StreamRanges -Entries $parsed.Entries -Data $Data
+# 
+#     $usable = $streams | Where-Object {
+#         $_.PayloadLength -gt 0 -and ($_.PayloadStart + $_.PayloadLength) -le $Data.Length
+#     }
+# 
+#     [PSCustomObject]@{
+#         Data    = $Data
+#         Strings = $strings
+#         Parsed  = $parsed
+#         Streams = $usable
+#     }
+# }
+
 function Resolve-CreoFileStreams {
-    param([Parameter(Mandatory)][string]$Path)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
 
-    if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path" }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Path not found: $Path"
+    }
 
-    [byte[]]$Data = [System.IO.File]::ReadAllBytes((Resolve-Path $Path))
+    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+
+    # When a directory is passed, process every file beneath it recursively.
+    if ($item.PSIsContainer) {
+        Get-ChildItem -LiteralPath $item.FullName -File -Recurse -Force |
+            ForEach-Object {
+                Resolve-CreoFileStreams -Path $_.FullName
+            }
+
+        return
+    }
+
+    # Original single-file behavior.
+    [byte[]]$Data = [System.IO.File]::ReadAllBytes($item.FullName)
+
     $strings = Get-PrintableStrings -Data $Data -MinLen 6
     $parsed  = Parse-TocEntries -Strings $strings -MinFields 8
     $streams = Resolve-StreamRanges -Entries $parsed.Entries -Data $Data
 
     $usable = $streams | Where-Object {
-        $_.PayloadLength -gt 0 -and ($_.PayloadStart + $_.PayloadLength) -le $Data.Length
+        $_.PayloadLength -gt 0 -and
+        ($_.PayloadStart + $_.PayloadLength) -le $Data.Length
     }
 
     [PSCustomObject]@{
+        Path    = $item.FullName
         Data    = $Data
         Strings = $strings
         Parsed  = $parsed
@@ -1964,13 +2009,14 @@ function Find-CreoString {
         [Alias("C")][int]$Context = -1,
         [Alias("Quiet")][switch]$AddressOnly,
         [switch]$Raw,
-        [switch]$IgnoreCase
+        [switch]$IgnoreCase,
+        [switch]$Color
     )
 
     begin {
         $bytesBefore = if ($Context -ge 0) { $Context } else { $BeforeContext }
         $bytesAfter  = if ($Context -ge 0) { $Context } else { $AfterContext }
-        $forceRaw = $Raw.IsPresent -or $PSBoundParameters.ContainsKey('Context') -or
+        $forceRaw = $Raw.IsPresent -or $Color.IsPresent -or $PSBoundParameters.ContainsKey('Context') -or
                     $PSBoundParameters.ContainsKey('BeforeContext') -or $PSBoundParameters.ContainsKey('AfterContext')
         $seenPaths = New-Object System.Collections.Generic.HashSet[string]
     }
@@ -2021,6 +2067,12 @@ function Find-CreoString {
                             $end = [Math]::Min($bytes.Length, $i + $term.Length + $bytesAfter)
                             $hexDump = if ($script:UseCSharpEngine) { [CreoNative]::GenerateHexDump($bytes, $start, $end) }
                             else { Format-HexWindow -Data $bytes -StartOffset $start -Length ($end - $start) }
+
+                            if ($Color.IsPresent) {
+                                Write-Host ""
+                                Write-Host "--- $($fileInfo.Name) : $streamName : '$term' @ 0x$($i.ToString('X8')) ---" -ForegroundColor DarkGray
+                                Write-CreoColorHexRows -Data $bytes[$start..($end - 1)] -BaseOffset $start
+                            }
                         }
 
                         $fileMatches.Add([PSCustomObject]@{
@@ -2280,6 +2332,50 @@ function Compare-CreoStreamBytes {
 }
 
 # =========================================================================
+# FUNCTION: Write-CreoColorHexRows (private)
+#   Shared coloring logic behind Show-CreoHexDump and Find-CreoString's
+#   -Color switch, so both stay in sync automatically instead of carrying
+#   two copies of the same byte-classification rules.
+# =========================================================================
+function Write-CreoColorHexRows {
+    param(
+        [Parameter(Mandatory)][byte[]]$Data,
+        [Parameter(Mandatory)][int]$BaseOffset,
+        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
+    )
+
+    $markerSet = New-Object 'System.Collections.Generic.HashSet[byte]'
+    foreach ($m in $MarkerBytes) { [void]$markerSet.Add([byte]$m) }
+
+    for ($row = 0; $row -lt $Data.Length; $row += 16) {
+        $rowEnd = [Math]::Min($row + 15, $Data.Length - 1)
+        Write-Host ("{0:X8}  " -f ($BaseOffset + $row)) -NoNewline -ForegroundColor DarkGray
+
+        for ($i = $row; $i -le ($row + 15); $i++) {
+            if ($i -gt $rowEnd) { Write-Host "   " -NoNewline; continue }
+            $b = $Data[$i]
+            $color = if ($markerSet.Contains($b)) { "Yellow" }
+                     elseif ($b -eq 0x00) { "DarkGray" }
+                     elseif ($b -ge 0x20 -and $b -le 0x7E) { "Gray" }
+                     else { "White" }
+            Write-Host ("{0:X2} " -f $b) -NoNewline -ForegroundColor $color
+        }
+
+        Write-Host " |" -NoNewline
+        for ($i = $row; $i -le $rowEnd; $i++) {
+            $b = $Data[$i]
+            $color = if ($markerSet.Contains($b)) { "Yellow" }
+                     elseif ($b -eq 0x00) { "DarkGray" }
+                     elseif ($b -ge 0x20 -and $b -le 0x7E) { "Gray" }
+                     else { "White" }
+            $ch = if ($b -ge 0x20 -and $b -le 0x7E) { [char]$b } else { '.' }
+            Write-Host $ch -NoNewline -ForegroundColor $color
+        }
+        Write-Host "|"
+    }
+}
+
+# =========================================================================
 # FUNCTION: Show-CreoHexDump
 #   Console-only (Write-Host, not pipeline output) colorized hex dump.
 #   Yellow = candidate marker byte (E0-E7/F6-FF family), Green = printable
@@ -2311,9 +2407,6 @@ function Show-CreoHexDump {
         [int]$Length = 256,
         [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
     )
-
-    $markerSet = New-Object 'System.Collections.Generic.HashSet[byte]'
-    foreach ($m in $MarkerBytes) { [void]$markerSet.Add([byte]$m) }
 
     if ($PSCmdlet.ParameterSetName -eq 'File') {
         if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path" }
@@ -2348,32 +2441,8 @@ function Show-CreoHexDump {
     Write-Host "Other" -ForegroundColor White
     Write-Host ""
 
-    for ($row = 0; $row -lt $data.Length; $row += 16) {
-        $rowEnd = [Math]::Min($row + 15, $data.Length - 1)
-        Write-Host ("{0:X8}  " -f ($base + $row)) -NoNewline -ForegroundColor Cyan
+    Write-CreoColorHexRows -Data $data -BaseOffset $base -MarkerBytes $MarkerBytes
 
-        for ($i = $row; $i -le ($row + 15); $i++) {
-            if ($i -gt $rowEnd) { Write-Host "   " -NoNewline; continue }
-            $b = $data[$i]
-            $color = if ($markerSet.Contains($b)) { "Yellow" }
-                     elseif ($b -eq 0x00) { "DarkGray" }
-                     elseif ($b -ge 0x20 -and $b -le 0x7E) { "Green" }
-                     else { "White" }
-            Write-Host ("{0:X2} " -f $b) -NoNewline -ForegroundColor $color
-        }
-
-        Write-Host " |" -NoNewline
-        for ($i = $row; $i -le $rowEnd; $i++) {
-            $b = $data[$i]
-            $color = if ($markerSet.Contains($b)) { "Yellow" }
-                     elseif ($b -eq 0x00) { "DarkGray" }
-                     elseif ($b -ge 0x20 -and $b -le 0x7E) { "Green" }
-                     else { "White" }
-            $ch = if ($b -ge 0x20 -and $b -le 0x7E) { [char]$b } else { '.' }
-            Write-Host $ch -NoNewline -ForegroundColor $color
-        }
-        Write-Host "|"
-    }
     Write-Host ""
 }
 
@@ -2474,8 +2543,403 @@ function Export-CreoThumbnail {
     }
 }
 
+function Extract-CreoThumbnail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName, Position = 0)]
+        [Alias('FullName', 'PSPath')]
+        [string[]]$Path
+    )
+
+    process {
+        foreach ($p in $Path) {
+            $resolved = Resolve-Path -Path $p -ErrorAction Stop
+            foreach ($item in $resolved) {
+                $File = $item.Path
+                $baseName = [IO.Path]::GetFileName($File)
+                $Out  = Join-Path (Split-Path $File) ("{0}_thumbnail.jpg" -f $baseName)
+
+                $Bytes = [System.IO.File]::ReadAllBytes($File)
+                $TagBytes = [System.Text.Encoding]::ASCII.GetBytes('THMB_IMG_MAIN')
+
+                $TagOffset = -1
+                for ($i = 0; $i -le $Bytes.Length - $TagBytes.Length; $i++) {
+                    $match = $true
+                    for ($j = 0; $j -lt $TagBytes.Length; $j++) {
+                        if ($Bytes[$i + $j] -ne $TagBytes[$j]) { $match = $false; break }
+                    }
+                    if ($match) { $TagOffset = $i; break }
+                }
+                if ($TagOffset -lt 0) {
+                    throw "THMB_IMG_MAIN tag not found in $File"
+                }
+
+                $JpegStart = -1
+                for ($i = $TagOffset + $TagBytes.Length; $i -lt [Math]::Min($TagOffset + 32, $Bytes.Length - 1); $i++) {
+                    if ($Bytes[$i] -eq 0xFF -and $Bytes[$i + 1] -eq 0xD8) {
+                        $JpegStart = $i
+                        break
+                    }
+                }
+                if ($JpegStart -lt 0) {
+                    throw "JPEG SOI FF D8 not found after THMB_IMG_MAIN in $File"
+                }
+
+                $JpegEnd = -1
+                for ($i = $JpegStart + 2; $i -lt $Bytes.Length - 1; $i++) {
+                    if ($Bytes[$i] -eq 0xFF -and $Bytes[$i + 1] -eq 0xD9) {
+                        $JpegEnd = $i + 1
+                        break
+                    }
+                }
+                if ($JpegEnd -lt 0) {
+                    throw "JPEG EOI FF D9 not found in $File"
+                }
+
+                $Length = $JpegEnd - $JpegStart + 1
+                $Jpeg = New-Object byte[] $Length
+                [Array]::Copy($Bytes, $JpegStart, $Jpeg, 0, $Length)
+                [System.IO.File]::WriteAllBytes($Out, $Jpeg)
+
+                [PSCustomObject]@{
+                    File      = $File
+                    Output    = $Out
+                    TagOffset = ('0x{0:X}' -f $TagOffset)
+                    JpegStart = ('0x{0:X}' -f $JpegStart)
+                    JpegEnd   = ('0x{0:X}' -f $JpegEnd)
+                    Length    = $Length
+                }
+            }
+        }
+    }
+}
+
+# =========================================================================
+# FUNCTION: Search-CreoBinary:
+#   It uses Parameter Sets to automatically adapt to what you hand it, 
+#   eliminating the need to remember different cmdlet names. It integrates
+#   stream-aware relative offsets, entropy calculation, and the colorized
+#   hex dump into a single, foolproof output.
+# =========================================================================
+
+function Search-CreoBinary {
+    <#
+    .SYNOPSIS
+        A unified utility for exploring binary file structures, mapping stream boundaries, 
+        and visually inspecting marker patterns.
+    .DESCRIPTION
+        This script compresses files from a local source folder and uploads 
+        the resulting zip archive to a backup server, keeping a local log entry.
+    .PARAMETER SourcePath
+        The directory on the local machine that you want to back up.
+    .EXAMPLE
+        Search-CreoBinary -Path .\models\*.prt.1 -Pattern "rev_string" -Context 60
+
+        Search for text (Automatically sizes the window and highlights default markers)
+    .EXAMPLE
+        $myMarker = [byte[]](0x0A, 0x72, 0x65, 0x76, 0x5F)
+        Search-CreoBinary -Path .\models\company_start_prt.prt.1 -SearchBytes $myMarker
+
+        Search for exact bytes (Automatically switches to byte-matching mode)
+    .EXAMPLE
+        Search-CreoBinary -Path .\models\company_start_prt.prt.1 -StreamName "FeatDefs" -Offset 0xB1
+
+        Jump to a specific address/stream (Replaces `Show-CreoHexDump`)   
+    .EXAMPLE
+        Search-CreoBinary -Path .\file.prt.1 -Pattern "PTC_" -MarkerBytes @(0xAA, 0xBB, 0xCC)
+
+        Supply custom marker bytes for syntax highlighting
+        By default, it highlights `0xE0-E7` and `0xF6-FF` in yellow. If you discover a new proprietary marker table you want to trace visually, just pass it    
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'SearchString')]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias("FullName")]
+        [string[]]$Path,
+
+        [Parameter(Mandatory, ParameterSetName = 'SearchString', Position = 0)]
+        [string[]]$Pattern,
+
+        [Parameter(Mandatory, ParameterSetName = 'SearchBytes')]
+        [byte[]]$SearchBytes,
+
+        [Parameter(Mandatory, ParameterSetName = 'DirectOffset')]
+        [int]$Offset,
+
+        [Parameter(ParameterSetName = 'DirectOffset')]
+        [string]$StreamName,
+
+        [Alias("B")][int]$BeforeContext = 32,
+        [Alias("A")][int]$AfterContext = 64,
+        [Alias("C")][int]$Context = -1,
+
+        [switch]$IgnoreCase,
+        [switch]$Quiet,    # Suppress visual hex dump, return objects only
+        [switch]$Raw,      # Output plain objects without grouping
+        
+        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
+    )
+
+    begin {
+        $bytesBefore = if ($Context -ge 0) { $Context } else { $BeforeContext }
+        $bytesAfter  = if ($Context -ge 0) { $Context } else { $AfterContext }
+        $seenPaths = [System.Collections.Generic.HashSet[string]]::new()
+
+        # Embedded helper for colorized terminal output
+        function Write-ColorDump([byte[]]$Data, [int]$BaseOffset, [byte[]]$Markers) {
+            $markerSet = [System.Collections.Generic.HashSet[byte]]::new()
+            foreach ($m in $Markers) { [void]$markerSet.Add([byte]$m) }
+
+            for ($row = 0; $row -lt $Data.Length; $row += 16) {
+                $rowEnd = [Math]::Min($row + 15, $Data.Length - 1)
+                Write-Host ("{0:X8}  " -f ($BaseOffset + $row)) -NoNewline -ForegroundColor DarkGray
+
+                # Hex side
+                for ($i = $row; $i -le ($row + 15); $i++) {
+                    if ($i -gt $rowEnd) { Write-Host "   " -NoNewline; continue }
+                    $b = $Data[$i]
+                    $color = if ($markerSet.Contains($b)) { "Yellow" }
+                             elseif ($b -eq 0x00) { "DarkGray" }
+                             elseif ($b -ge 0x20 -and $b -le 0x7E) { "Green" }
+                             else { "White" }
+                    Write-Host ("{0:X2} " -f $b) -NoNewline -ForegroundColor $color
+                }
+
+                Write-Host " |" -NoNewline
+                
+                # ASCII side
+                for ($i = $row; $i -le $rowEnd; $i++) {
+                    $b = $Data[$i]
+                    $color = if ($markerSet.Contains($b)) { "Yellow" }
+                             elseif ($b -eq 0x00) { "DarkGray" }
+                             elseif ($b -ge 0x20 -and $b -le 0x7E) { "Green" }
+                             else { "White" }
+                    $ch = if ($b -ge 0x20 -and $b -le 0x7E) { [char]$b } else { '.' }
+                    Write-Host $ch -NoNewline -ForegroundColor $color
+                }
+                Write-Host "|"
+            }
+        }
+    }
+
+    process {
+        foreach ($filePath in $Path) {
+            $resolvedPaths = Resolve-Path -Path $filePath -ErrorAction SilentlyContinue
+            foreach ($rp in $resolvedPaths) {
+                if (-not $seenPaths.Add($rp.Path)) { continue }
+
+                $fileInfo = [System.IO.FileInfo]::new($rp.Path)
+                if (-not $fileInfo.Exists) { continue }
+
+                # Assumes your Resolve-CreoFileStreams and Get-Entropy functions are in scope
+                $resolved = Resolve-CreoFileStreams -Path $fileInfo.FullName
+                $bytes = $resolved.Data
+                $sortedStreams = @($resolved.Streams | Sort-Object PayloadStart)
+                
+                $targetOffsets = [System.Collections.Generic.List[int]]::new()
+                $searchTerms = @()
+
+                # Determine target offsets based on the parameter set used
+                if ($PSCmdlet.ParameterSetName -eq 'DirectOffset') {
+                    $start = $Offset
+                    if ($StreamName) {
+                        $stream = $sortedStreams | Where-Object { $_.Name -eq $StreamName } | Select-Object -First 1
+                        if ($stream) { $start = [int]$stream.PayloadStart + $Offset }
+                    }
+                    $targetOffsets.Add([Math]::Max(0, $start))
+                    $searchTerms = @("Direct Address: 0x$($start.ToString('X8'))")
+                }
+                elseif ($PSCmdlet.ParameterSetName -eq 'SearchBytes') {
+                    $searchTerms = @("Byte Pattern")
+                    if ($script:UseCSharpEngine) {
+                        $targetOffsets.AddRange([CreoNative]::FindBytePattern($bytes, $SearchBytes, $false))
+                    } else {
+                        $targetOffsets.AddRange((Find-BytePatternOffsets -Payload $bytes -Needle $SearchBytes))
+                    }
+                }
+                else {
+                    # SearchString
+                    foreach ($term in $Pattern) {
+                        if ([string]::IsNullOrEmpty($term)) { continue }
+                        $needle = [System.Text.Encoding]::ASCII.GetBytes($term)
+                        $searchTerms += $term
+                        
+                        if ($script:UseCSharpEngine) {
+                            $targetOffsets.AddRange([CreoNative]::FindBytePattern($bytes, $needle, $IgnoreCase.IsPresent))
+                        } else {
+                            $targetOffsets.AddRange((Find-BytePatternOffsets -Payload $bytes -Needle $needle))
+                        }
+                    }
+                }
+
+                $targetOffsets = $targetOffsets | Sort-Object -Unique
+
+                foreach ($hit in $targetOffsets) {
+                    # Resolve which stream this offset belongs to
+                    $streamName = "UNRESOLVED_REGION"
+                    $relativeOffset = $hit
+                    
+                    foreach ($s in $sortedStreams) {
+                        if ($s.PayloadStart -le $hit -and $hit -lt ($s.PayloadStart + $s.PayloadLength)) {
+                            $streamName = $s.Name
+                            $relativeOffset = $hit - $s.PayloadStart
+                            break
+                        }
+                    }
+
+                    # Calculate display window bounds
+                    $start = [Math]::Max(0, $hit - $bytesBefore)
+                    $end = [Math]::Min($bytes.Length, $hit + 1 + $bytesAfter) # +1 acts as dummy length for direct offsets
+                    if ($PSCmdlet.ParameterSetName -eq 'SearchBytes') { $end = [Math]::Min($bytes.Length, $hit + $SearchBytes.Length + $bytesAfter) }
+                    elseif ($PSCmdlet.ParameterSetName -eq 'SearchString') { $end = [Math]::Min($bytes.Length, $hit + $term.Length + $bytesAfter) }
+                    
+                    $windowBytes = $bytes[$start..($end - 1)]
+
+                    # Visual Output
+                    if (-not $Quiet) {
+                        Write-Host "`n=====================================================================" -ForegroundColor Cyan
+                        Write-Host " FILE    : " -NoNewline; Write-Host $fileInfo.Name -ForegroundColor White
+                        Write-Host " STREAM  : " -NoNewline; Write-Host $streamName -ForegroundColor White
+                        Write-Host " OFFSET  : " -NoNewline; Write-Host ("0x{0:X8} (Absolute) | 0x{1:X8} (Relative)" -f $hit, $relativeOffset) -ForegroundColor White
+                        
+                        # Only calculate entropy if the helper is loaded
+                        if (Get-Command Get-Entropy -ErrorAction SilentlyContinue) {
+                            $entropy = Get-Entropy -Data $windowBytes
+                            Write-Host " ENTROPY : " -NoNewline; Write-Host ("{0:N3}" -f $entropy) -ForegroundColor White
+                        }
+                        
+                        Write-Host "=====================================================================" -ForegroundColor Cyan
+                        Write-ColorDump -Data $windowBytes -BaseOffset $start -Markers $MarkerBytes
+                    }
+
+                    # Pipeline Output
+                    if ($Raw -or $Quiet) {
+                        [PSCustomObject]@{
+                            FileName       = $fileInfo.Name
+                            Stream         = $streamName
+                            AbsoluteOffset = ("0x{0:X8}" -f $hit)
+                            RelativeOffset = ("0x{0:X8}" -f $relativeOffset)
+                            WindowBytes    = $windowBytes.Count
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# =========================================================================
+# FUNCTION: Invoke-CreoRegionAnalysis:
+#   This command will accept the object output from Search-CreoBinary 
+#   (which outputs Block, RelativeOffset, and absolute Offset) directly
+#   via the pipeline. It will then act as an orchestrator, calling your 
+#   existing, more granular functions (Get-CreoStreamSchema, 
+#   Show-CreoHexDump, etc.) to generate a unified, comprehensive snapshot
+#   of that specific memory region.
+# =========================================================================
+
+function Invoke-CreoRegionAnalysis {
+    <#
+    .SYNOPSIS
+        Performs deep, localized analysis on a specific byte offset within a Creo binary file stream.
+
+    .DESCRIPTION
+        Invoke-CreoRegionAnalysis acts as an orchestrator for various Creo exploratory functions. 
+        It is designed to accept pipeline input directly from search cmdlets (like Search-CreoBinaryString) 
+        and automatically generate a contextual report of the surrounding bytes. It aggregates colorized hex dumps, 
+        nearby E0 schema extractions, and E1/E3 parameter decodings to help identify structural motifs without 
+        running slow, full-file analysis.
+
+    .EXAMPLE
+        Search-CreoBinaryString -Path .\models\company_start_prt.prt.1 -Pattern "gcd_uid" | Invoke-CreoRegionAnalysis -Path .\models\company_start_prt.prt.1
+
+        Searches for the string "gcd_uid" and pipes the resulting hit objects directly into the analyzer. 
+        The analyzer outputs a contextual hex dump and nearby data structures for every match.
+
+    .EXAMPLE
+        [PSCustomObject]@{ Stream = "MdlStatus"; Offset = "0x0001ACFF" } | Invoke-CreoRegionAnalysis -Path .\models\company_start_prt.prt.1 -ContextWindow 256
+
+        Manually specifies a known stream and hex offset to analyze, expanding the hex dump and schema search radius to 256 bytes.    
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory, ValueFromPipelineByPropertyName)]
+        [Alias('Block')]
+        [string]$Stream,
+
+        [Parameter(Mandatory, ValueFromPipelineByPropertyName)]
+        [string]$Offset, 
+
+        [int]$ContextWindow = 128
+    )
+
+    process {
+        # 1. Convert the Hex string offset back to an integer
+        $absOffset = [Convert]::ToInt32($Offset, 16)
+        
+        Write-Host "`n=====================================================================" -ForegroundColor Cyan
+        Write-Host " CREO REGION ANALYSIS: $Stream @ $Offset" -ForegroundColor Cyan
+        Write-Host "=====================================================================" -ForegroundColor Cyan
+
+        # 2. Resolve the file and isolate the stream
+        $resolved = Resolve-CreoFileStreams -Path $Path
+        $targetStream = $resolved.Streams | Where-Object { $_.Name -eq $Stream } | Select-Object -First 1
+
+        if (-not $targetStream) {
+            Write-Warning "Could not resolve stream $Stream in $Path"
+            return
+        }
+
+        # 3. Output a colorized Hex Dump of the immediate area
+        $dumpStart = [Math]::Max([int]$targetStream.PayloadStart, $absOffset - ($ContextWindow / 2))
+        
+        # Calculate the safe end of the slice to prevent out-of-bounds errors at the EOF
+        $sliceEnd = [Math]::Min($dumpStart + $ContextWindow - 1, $resolved.Data.Length - 1)
+        
+        # Strictly slice the byte array so the hex dumper cannot read past the context window
+        $windowBytes = $resolved.Data[$dumpStart..$sliceEnd]
+
+        Write-Host "`n[+] Colorized Hex Dump (-$($ContextWindow/2) to +$($ContextWindow/2) bytes)" -ForegroundColor Yellow
+        
+        # Pass only the sliced bytes. BaseOffset is kept so your UI prints the correct memory addresses on the left.
+        Show-CreoHexDump -Bytes $windowBytes -BaseOffset $dumpStart
+
+        # 4. Check for nearby structural schemas (E0 markers)
+        $schema = Get-CreoStreamSchema -ResolvedStream $targetStream -FileBytes $resolved.Data
+        $nearbySchema = $schema | Where-Object { 
+            $_.AbsoluteOffset -ge $dumpStart -and 
+            $_.AbsoluteOffset -le ($dumpStart + $ContextWindow) 
+        }
+
+        if ($nearbySchema) {
+            Write-Host "`n[+] Nearby Parsed Schema Properties (E0 Type Encodings)" -ForegroundColor Yellow
+            $nearbySchema | Format-Table AbsoluteOffset, OpcodeType, PropertyName -AutoSize | Out-String | Write-Host
+        } else {
+            Write-Host "`n[-] No E0 Schema properties found in this immediate window." -ForegroundColor DarkGray
+        }
+
+        # 5. Check for extracted parameters in the payload
+        $streamStart = [int]$targetStream.PayloadStart
+        $streamLen = [int]$targetStream.PayloadLength
+        $payload = $resolved.Data[$streamStart..($streamStart + $streamLen - 1)]
+        
+        $params = Get-CreoParametersFromPayloadPS -Payload $payload
+        if ($params) {
+            Write-Host "`n[+] E1/E3 Parameters Found in Stream (Top 5)" -ForegroundColor Yellow
+            $params | Select-Object -First 5 | Format-Table ParameterName, TypeName, ParameterValue -AutoSize | Out-String | Write-Host
+        }
+
+        Write-Host "=====================================================================`n" -ForegroundColor Cyan
+    }
+}
+
+
 Export-ModuleMember -Function `
     Export-CreoThumbnail, `
+    Extract-CreoThumbnail, `
     Compare-CreoStreamBytes, `
     Show-CreoHexDump, `
     Get-CreoDataMaps, `
@@ -2501,4 +2965,6 @@ Export-ModuleMember -Function `
     Get-CreoModelStreamSchema, `
     Measure-CreoValueWidth, `
     Find-CreoString, `
-    Get-CreoParameter
+    Get-CreoParameter,`
+    Search-CreoBinary,`
+    Invoke-CreoRegionAnalysis
