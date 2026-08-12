@@ -4690,6 +4690,442 @@ function Show-CreoStreamHashMatrix {
     }
 }
 
+
+function Get-CreoCandidatePlmHashes {
+    <#
+    .SYNOPSIS
+        Produces provisional PLM-oriented composite hashes for Creo files.
+
+    .DESCRIPTION
+        IMPORTANT:
+        Every profile in this function is deliberately named "Candidate".
+        These profiles are based on controlled tests of prt0001.prt.1-.10,
+        not on an official Creo binary-file specification.
+
+        The profiles are intended to be revised as you run more experiments,
+        validate behavior with assemblies, and identify semantic record
+        formats.
+
+        Current candidate evidence:
+
+        CandidateGeometryStreamName:
+          - AllFeatur
+          - BasicText
+          - NeuAsmSld
+          - VisibGeom
+
+        These streams were selected because they:
+          - Stayed unchanged for the .7 -> .8 parameter string change.
+          - Changed for the .8 -> .9 revolve-cut addition.
+          - Returned to the .8 hash in .10 after deleting that cut.
+
+        CandidateParameterPersistenceStreamName:
+          - ActEntity
+          - FeatDefs
+          - FeatDefsIndex
+          - FeatRefData
+          - NeuPrtSld
+
+        These streams changed during .7 -> .8, where the only intended
+        change was PARAMETER_3:
+          "This Is My String" -> "This Is NOT My String"
+
+        This is NOT YET a semantic parameter hash. It is a conservative
+        parameter-persistence candidate and can change for unrelated
+        serialized-state changes.
+
+        CandidateAnnotationStreamName:
+          Empty by default, because annotations have not yet been validated
+          with controlled note/dimension/symbol experiments.
+
+    .EXAMPLE
+        Get-CreoCandidatePlmHashes -Path '.\models\prt0001.prt.*' |
+            Format-Table FileName,
+                         CandidateGeometryHash,
+                         CandidateParameterPersistenceHash,
+                         CandidateNativeDefinitionHash -AutoSize
+
+    .EXAMPLE
+        # Compare only revisions .8, .9, and .10.
+        Get-CreoCandidatePlmHashes `
+            -Path '.\models\prt0001.prt.8',
+                  '.\models\prt0001.prt.9',
+                  '.\models\prt0001.prt.10' |
+            Format-Table FileName,
+                         CandidateGeometryHash,
+                         CandidateParameterPersistenceHash,
+                         CandidateNativeDefinitionHash -AutoSize
+
+    .EXAMPLE
+        # Later, after annotation testing, supply a provisional profile.
+        Get-CreoCandidatePlmHashes `
+            -Path '.\models\prt0001.prt.*' `
+            -CandidateAnnotationStreamName 'Notes', 'DwgData'
+
+    .EXAMPLE
+        # Test an alternative geometry profile without changing the function.
+        Get-CreoCandidatePlmHashes `
+            -Path '.\models\prt0001.prt.*' `
+            -CandidateGeometryStreamName 'AllFeatur',
+                                         'BasicText',
+                                         'NeuAsmSld',
+                                         'VisibGeom',
+                                         'ModelView#9'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Path,
+
+        # -----------------------------------------------------------------
+        # Candidate Geometry Profile
+        #
+        # Current test evidence:
+        # .7 -> .8 parameter edit: same
+        # .8 -> .9 revolve cut:     changed
+        # .9 -> .10 cut deletion:   returned to .8 hash
+        #
+        # Continue validating this profile using:
+        # - save-only tests
+        # - datum visibility tests
+        # - parameter add/edit tests
+        # - annotation tests
+        # - controlled geometry changes
+        # - assembly model tests
+        # -----------------------------------------------------------------
+        [string[]]$CandidateGeometryStreamName = @(
+            'AllFeatur',
+            'BasicText',
+            'NeuAsmSld',
+            'VisibGeom'
+        ),
+
+        # -----------------------------------------------------------------
+        # Candidate Parameter Persistence Profile
+        #
+        # Current test evidence:
+        # .7 -> .8 parameter string edit changed all of these streams.
+        #
+        # This profile is intentionally conservative and may include
+        # non-parameter persistence. Replace it eventually with a semantic
+        # PARAMETER_* record extractor and normalized parameter hash.
+        # -----------------------------------------------------------------
+        [string[]]$CandidateParameterPersistenceStreamName = @(
+            'ActEntity',
+            'FeatDefs',
+            'FeatDefsIndex',
+            'FeatRefData',
+            'NeuPrtSld'
+        ),
+
+        # -----------------------------------------------------------------
+        # Candidate Annotation Profile
+        #
+        # Leave empty until controlled tests establish which streams change
+        # only for annotation/note/dimension/symbol edits.
+        #
+        # Example future candidate:
+        # -CandidateAnnotationStreamName 'Notes', 'DwgData'
+        # -----------------------------------------------------------------
+        [string[]]$CandidateAnnotationStreamName = @(),
+
+        # Include per-profile stream components in the output object.
+        # Useful for SQL ingestion or diagnosing profile differences.
+        [switch]$IncludeCandidateComponents
+    )
+
+    begin {
+        function Get-CreoCandidateSha256 {
+            param(
+                [Parameter(Mandatory)]
+                [string]$CandidateText
+            )
+
+            [byte[]]$candidateBytes =
+                [System.Text.Encoding]::UTF8.GetBytes($CandidateText)
+
+            $candidateSha256 =
+                [System.Security.Cryptography.SHA256]::Create()
+
+            try {
+                [byte[]]$candidateHashBytes =
+                    $candidateSha256.ComputeHash($candidateBytes)
+
+                return (
+                    [System.BitConverter]::ToString($candidateHashBytes) `
+                        -replace '-', ''
+                )
+            }
+            finally {
+                if ($null -ne $candidateSha256) {
+                    $candidateSha256.Dispose()
+                }
+            }
+        }
+
+        function New-CreoCandidateProfile {
+            param(
+                [Parameter(Mandatory)]
+                [string]$CandidateProfileName,
+
+                [Parameter()]
+                [AllowEmptyCollection()]
+                [string[]]$CandidateStreamNames,
+
+                [Parameter(Mandatory)]
+                [object[]]$CandidateFileFingerprintRows
+            )
+
+            # No candidate stream profile means no hash should be claimed.
+            if ($null -eq $CandidateStreamNames -or
+                $CandidateStreamNames.Count -eq 0) {
+                return [PSCustomObject]@{
+                    CandidateProfileName          = $CandidateProfileName
+                    CandidateProfileConfigured    = $false
+                    CandidateProfileComplete      = $false
+                    CandidateHash                 = $null
+                    CandidateIncludedStreamCount  = 0
+                    CandidateMissingStreamCount   = 0
+                    CandidateMissingStreams       = @()
+                    CandidateComponents           = @()
+                }
+            }
+
+            # Make the profile deterministic:
+            # no duplicate names, case-insensitive sort.
+            $candidateExpectedStreams = @(
+                $CandidateStreamNames |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    } |
+                    Sort-Object -Unique
+            )
+
+            # Map this file's stream names to fingerprints.
+            $candidateStreamLookup = @{}
+
+            foreach ($candidateRow in $CandidateFileFingerprintRows) {
+                if (-not $candidateStreamLookup.ContainsKey(
+                    [string]$candidateRow.StreamName
+                )) {
+                    $candidateStreamLookup[
+                        [string]$candidateRow.StreamName
+                    ] = $candidateRow
+                }
+            }
+
+            $candidateCanonicalLines =
+                [System.Collections.Generic.List[string]]::new()
+
+            $candidateComponents =
+                [System.Collections.Generic.List[object]]::new()
+
+            $candidateMissingStreams =
+                [System.Collections.Generic.List[string]]::new()
+
+            foreach ($candidateStreamName in $candidateExpectedStreams) {
+                if ($candidateStreamLookup.ContainsKey(
+                    $candidateStreamName
+                )) {
+                    $candidateRow =
+                        $candidateStreamLookup[$candidateStreamName]
+
+                    # Canonical input contains only stable stream identity,
+                    # payload size, and raw stream hash.
+                    #
+                    # Do NOT include offsets: stream offsets can move due to
+                    # unrelated persistence changes.
+                    $candidateCanonicalLine = (
+                        'STREAM|{0}|{1}|{2}' -f
+                        $candidateRow.StreamName,
+                        $candidateRow.PayloadLength,
+                        $candidateRow.SHA256
+                    )
+
+                    $candidateCanonicalLines.Add($candidateCanonicalLine)
+
+                    $candidateComponents.Add([PSCustomObject]@{
+                        StreamName    = $candidateRow.StreamName
+                        PayloadLength = $candidateRow.PayloadLength
+                        SHA256        = $candidateRow.SHA256
+                        Present       = $true
+                    })
+                }
+                else {
+                    # Include an explicit missing marker in the canonical
+                    # input, so an absent stream changes the profile hash.
+                    $candidateCanonicalLines.Add(
+                        'MISSING|{0}' -f $candidateStreamName
+                    )
+
+                    $candidateMissingStreams.Add($candidateStreamName)
+
+                    $candidateComponents.Add([PSCustomObject]@{
+                        StreamName    = $candidateStreamName
+                        PayloadLength = $null
+                        SHA256        = $null
+                        Present       = $false
+                    })
+                }
+            }
+
+            $candidateCanonicalText = @(
+                'PROFILE|{0}' -f $CandidateProfileName
+                'PROFILE_VERSION|1'
+                $candidateCanonicalLines
+            ) -join "`n"
+
+            return [PSCustomObject]@{
+                CandidateProfileName         = $CandidateProfileName
+                CandidateProfileConfigured   = $true
+                CandidateProfileComplete     = (
+                    $candidateMissingStreams.Count -eq 0
+                )
+                CandidateHash                = Get-CreoCandidateSha256 `
+                    -CandidateText $candidateCanonicalText
+                CandidateIncludedStreamCount = (
+                    $candidateExpectedStreams.Count -
+                    $candidateMissingStreams.Count
+                )
+                CandidateMissingStreamCount  = $candidateMissingStreams.Count
+                CandidateMissingStreams      = $candidateMissingStreams.ToArray()
+                CandidateComponents          = $candidateComponents.ToArray()
+            }
+        }
+    }
+
+    process {
+        # Uses your existing wildcard-aware fingerprint function.
+        $candidateFingerprintRows = @(
+            Get-CreoStreamFingerprints -Path $Path
+        )
+
+        if ($candidateFingerprintRows.Count -eq 0) {
+            throw 'No Creo stream fingerprints were produced.'
+        }
+
+        $candidateFiles = @(
+            $candidateFingerprintRows |
+                Group-Object FilePath |
+                ForEach-Object {
+                    $_.Group | Select-Object -First 1
+                } |
+                Sort-Object FileName
+        )
+
+        foreach ($candidateFile in $candidateFiles) {
+            $candidateFileRows = @(
+                $candidateFingerprintRows |
+                    Where-Object {
+                        $_.FilePath -eq $candidateFile.FilePath
+                    }
+            )
+
+            # Exact artifact hash: useful for audit and deduplication.
+            $candidateFileHash =
+                Get-FileHash `
+                    -LiteralPath $candidateFile.FilePath `
+                    -Algorithm SHA256
+
+            $candidateGeometryProfile = New-CreoCandidateProfile `
+                -CandidateProfileName 'CandidateGeometryProfileV1' `
+                -CandidateStreamNames $CandidateGeometryStreamName `
+                -CandidateFileFingerprintRows $candidateFileRows
+
+            $candidateParameterProfile = New-CreoCandidateProfile `
+                -CandidateProfileName 'CandidateParameterPersistenceProfileV1' `
+                -CandidateStreamNames `
+                    $CandidateParameterPersistenceStreamName `
+                -CandidateFileFingerprintRows $candidateFileRows
+
+            # The candidate native-definition profile intentionally includes
+            # both geometry-sensitive and parameter-sensitive candidate
+            # streams. It is useful when configuration control cares about
+            # either geometry OR parameter persistence changes.
+            $candidateNativeDefinitionStreamNames = @(
+                $CandidateGeometryStreamName +
+                $CandidateParameterPersistenceStreamName |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    } |
+                    Sort-Object -Unique
+            )
+
+            $candidateNativeDefinitionProfile = New-CreoCandidateProfile `
+                -CandidateProfileName 'CandidateNativeDefinitionProfileV1' `
+                -CandidateStreamNames `
+                    $candidateNativeDefinitionStreamNames `
+                -CandidateFileFingerprintRows $candidateFileRows
+
+            $candidateAnnotationProfile = New-CreoCandidateProfile `
+                -CandidateProfileName 'CandidateAnnotationProfileV1' `
+                -CandidateStreamNames $CandidateAnnotationStreamName `
+                -CandidateFileFingerprintRows $candidateFileRows
+
+            $candidateResult = [ordered]@{
+                FilePath  = $candidateFile.FilePath
+                FileName  = $candidateFile.FileName
+                FileSHA256 = $candidateFileHash.Hash
+
+                # Candidate geometry-equivalence profile.
+                CandidateGeometryHash = $candidateGeometryProfile.CandidateHash
+                CandidateGeometryProfileConfigured =
+                    $candidateGeometryProfile.CandidateProfileConfigured
+                CandidateGeometryProfileComplete =
+                    $candidateGeometryProfile.CandidateProfileComplete
+                CandidateGeometryMissingStreams =
+                    $candidateGeometryProfile.CandidateMissingStreams -join ', '
+
+                # Candidate parameter-persistence profile.
+                CandidateParameterPersistenceHash =
+                    $candidateParameterProfile.CandidateHash
+                CandidateParameterProfileConfigured =
+                    $candidateParameterProfile.CandidateProfileConfigured
+                CandidateParameterProfileComplete =
+                    $candidateParameterProfile.CandidateProfileComplete
+                CandidateParameterMissingStreams =
+                    $candidateParameterProfile.CandidateMissingStreams -join ', '
+
+                # Candidate union profile: geometry + parameter persistence.
+                CandidateNativeDefinitionHash =
+                    $candidateNativeDefinitionProfile.CandidateHash
+                CandidateNativeDefinitionProfileComplete =
+                    $candidateNativeDefinitionProfile.CandidateProfileComplete
+                CandidateNativeDefinitionMissingStreams =
+                    $candidateNativeDefinitionProfile.CandidateMissingStreams -join ', '
+
+                # Intentionally unconfigured until annotation testing exists.
+                CandidateAnnotationHash =
+                    $candidateAnnotationProfile.CandidateHash
+                CandidateAnnotationProfileConfigured =
+                    $candidateAnnotationProfile.CandidateProfileConfigured
+                CandidateAnnotationProfileComplete =
+                    $candidateAnnotationProfile.CandidateProfileComplete
+                CandidateAnnotationMissingStreams =
+                    $candidateAnnotationProfile.CandidateMissingStreams -join ', '
+            }
+
+            if ($IncludeCandidateComponents) {
+                $candidateResult['CandidateGeometryComponents'] =
+                    $candidateGeometryProfile.CandidateComponents
+
+                $candidateResult['CandidateParameterComponents'] =
+                    $candidateParameterProfile.CandidateComponents
+
+                $candidateResult['CandidateNativeDefinitionComponents'] =
+                    $candidateNativeDefinitionProfile.CandidateComponents
+
+                $candidateResult['CandidateAnnotationComponents'] =
+                    $candidateAnnotationProfile.CandidateComponents
+            }
+
+            [PSCustomObject]$candidateResult
+        }
+    }
+}
+
+
 Export-ModuleMember -Function `
     Export-CreoThumbnail, `
     Extract-CreoThumbnail, `
@@ -4724,4 +5160,5 @@ Export-ModuleMember -Function `
     Trace-CreoPointerReference, `
     Export-CreoRegionBlob,
     Get-CreoStreamFingerprints, `
-    Show-CreoStreamHashMatrix
+    Show-CreoStreamHashMatrix, `
+    Get-CreoCandidatePlmHashes
