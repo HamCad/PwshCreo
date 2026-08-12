@@ -807,7 +807,14 @@ function Resolve-CreoFileStreams {
 }
 
 function Find-BytePatternOffsets {
-    param([byte[]]$Payload, [byte[]]$Needle)
+    param(
+        [byte[]]$Payload,
+
+        [Parameter(Mandatory)]
+        [object]$Needle
+    )
+
+    [byte[]]$Needle = ConvertTo-CreoByteArray -InputObject $Needle
 
     if ($script:UseCSharpEngine) {
         return [CreoNative]::FindBytePattern($Payload, $Needle, $false)
@@ -877,11 +884,17 @@ function Get-CreoMarkerStatistics {
 function Find-CreoMarkerSequence {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte[]]$Pattern,
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [object]$Pattern,
+
         [int]$Context = 12,
         [int]$NearbyStringRadius = 64
     )
+
+    [byte[]]$Pattern = ConvertTo-CreoByteArray -InputObject $Pattern
 
     $resolved = Resolve-CreoFileStreams -Path $Path
     $Data = $resolved.Data
@@ -1123,10 +1136,22 @@ function Resolve-CreoStreamsNormalized {
 function Get-CreoByteTransitionStats {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte]$Marker,
+        [Parameter(Mandatory)]
+        [string]$Path,
+        
+        [Parameter(Mandatory)]
+        [object]$Marker,
+
         [Parameter()]$ResolvedStreams
     )
+    [byte[]]$markerBytes = ConvertTo-CreoByteArray -InputObject $Marker
+
+    if ($markerBytes.Length -ne 1) {
+        throw "-Marker must be exactly one byte, for example E3 or 0xE3."
+    }
+
+    [byte]$Marker = $markerBytes[0]
+
 
     $context = Resolve-CreoStreamsNormalized -Path $Path -ResolvedStreams $ResolvedStreams
     $streams = @($context.Streams)
@@ -1289,14 +1314,32 @@ function Measure-CreoEntropyRegions {
     return $results
 }
 
+
+# Example:
+# Get-ChildItem .\models\prt0001* | ForEach-Object {
+#     Find-CreoMarkerClusters -Path $_.FullName -Marker E9
+# }
+
 function Find-CreoMarkerClusters {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte]$Marker,
+        [Parameter(Mandatory)]
+        [string]$Path,
+        
+        [Parameter(Mandatory)]
+        [object]$Marker,
+        
         [int]$MaxGap = 64,
         [Parameter()]$ResolvedStreams
     )
+    [byte[]]$markerBytes = ConvertTo-CreoByteArray -InputObject $Marker
+
+    if ($markerBytes.Length -ne 1) {
+        throw "-Marker must be exactly one byte, for example E3 or 0xE3."
+    }
+
+    [byte]$Marker = $markerBytes[0]
+
 
     $context = Resolve-CreoStreamsNormalized -Path $Path -ResolvedStreams $ResolvedStreams
     $streams = @($context.Streams)
@@ -1504,14 +1547,32 @@ function Get-CreoMarkerPairs {
 function Test-CreoTlvHypothesis {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte]$Marker,
-        [ValidateSet(1,2,4)][int]$LengthBytes = 1,
-        [ValidateSet('LE','BE')][string]$Endian = 'LE',
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [object]$Marker,
+
+        [ValidateSet(1,2,4)]
+        [int]$LengthBytes = 1,
+        
+        [ValidateSet('LE','BE')]
+        [string]$Endian = 'LE',
+        
         [int]$HeaderOffset = 0,
+        
         [int]$Tolerance = 0,
+        
         [Parameter()]$ResolvedStreams
     )
+    [byte[]]$markerBytes = ConvertTo-CreoByteArray -InputObject $Marker
+
+    if ($markerBytes.Length -ne 1) {
+        throw "-Marker must be exactly one byte, for example E3 or 0xE3."
+    }
+
+    [byte]$Marker = $markerBytes[0]
+
 
     $context = Resolve-CreoStreamsNormalized -Path $Path -ResolvedStreams $ResolvedStreams
     $streams = @($context.Streams)
@@ -1660,11 +1721,24 @@ function Get-CreoStringContext {
 function Get-CreoMarkerValueDistribution {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][byte]$Marker,
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [object]$Marker,
+
         [int]$ValueBytes = 1,
+
         [Parameter()]$ResolvedStreams
     )
+    [byte[]]$markerBytes = ConvertTo-CreoByteArray -InputObject $Marker
+
+    if ($markerBytes.Length -ne 1) {
+        throw "-Marker must be exactly one byte, for example E3 or 0xE3."
+    }
+
+    [byte]$Marker = $markerBytes[0]
+
 
     $context = Resolve-CreoStreamsNormalized -Path $Path -ResolvedStreams $ResolvedStreams
     $streams = @($context.Streams)
@@ -1710,13 +1784,14 @@ function Find-CreoMarkerMotifs {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF),
+        [object]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF),
         [int]$MaxGap = 3,
         [int]$MinMotifLength = 2,
         [int]$MaxMotifLength = 4,
         [int]$Top = 30,
         [Parameter()]$ResolvedStreams
     )
+    [byte[]]$MarkerBytes = ConvertTo-CreoByteArray -InputObject $MarkerBytes
 
     $context = Resolve-CreoStreamsNormalized -Path $Path -ResolvedStreams $ResolvedStreams
     $streams = @($context.Streams)
@@ -1927,13 +2002,19 @@ function Get-CreoModelStreamSchema {
 }
 
 function Measure-CreoValueWidth {
-    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [byte[]]$TypeBytes,
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [object]$TypeBytes,
+
         [string[]]$StreamNames,
         [Parameter()]$ResolvedStreams
     )
+
+    if ($null -ne $TypeBytes) {
+        [byte[]]$TypeBytes = ConvertTo-CreoByteArray -InputObject $TypeBytes
+    }
 
     $context = Resolve-CreoStreamsNormalized -Path $Path -ResolvedStreams $ResolvedStreams
     $streams = @($context.Streams)
@@ -2346,10 +2427,16 @@ function Compare-CreoStreamBytes {
 # =========================================================================
 function Write-CreoColorHexRows {
     param(
-        [Parameter(Mandatory)][byte[]]$Data,
-        [Parameter(Mandatory)][int]$BaseOffset,
-        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
+        [Parameter(Mandatory)]
+        [byte[]]$Data,
+
+        [Parameter(Mandatory)]
+        [int]$BaseOffset,
+
+        [object]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
     )
+
+    [byte[]]$MarkerBytes = ConvertTo-CreoByteArray -InputObject $MarkerBytes
 
     $markerSet = New-Object 'System.Collections.Generic.HashSet[byte]'
     foreach ($m in $MarkerBytes) { [void]$markerSet.Add([byte]$m) }
@@ -2408,12 +2495,14 @@ function Show-CreoHexDump {
 
         [Parameter(Mandatory, ParameterSetName = 'Bytes')]
         [byte[]]$Bytes,
+
         [Parameter(ParameterSetName = 'Bytes')]
         [int]$BaseOffset = 0,
 
         [int]$Length = 256,
-        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
+        [object]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
     )
+    [byte[]]$MarkerBytes = ConvertTo-CreoByteArray -InputObject $MarkerBytes
 
     if ($PSCmdlet.ParameterSetName -eq 'File') {
         if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path" }
@@ -2791,7 +2880,7 @@ function Search-CreoBinary {
         [string[]]$Pattern,
 
         [Parameter(Mandatory, ParameterSetName = 'SearchBytes')]
-        [byte[]]$SearchBytes,
+        [object]$SearchBytes,
 
         [Parameter(Mandatory, ParameterSetName = 'DirectOffset')]
         [int]$Offset,
@@ -2807,10 +2896,16 @@ function Search-CreoBinary {
         [switch]$Quiet,    # Suppress visual hex dump, return objects only
         [switch]$Raw,      # Output plain objects without grouping
         
-        [byte[]]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
-    )
+        [object]$MarkerBytes = @(0xE0,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xF6,0xF7,0xF8,0xF9,0xFA,0xFB,0xFC,0xFD,0xFE,0xFF)
 
+    )
     begin {
+        [byte[]]$MarkerBytes = ConvertTo-CreoByteArray -InputObject $MarkerBytes
+
+        if ($PSCmdlet.ParameterSetName -eq 'SearchBytes') {
+            [byte[]]$SearchBytes = ConvertTo-CreoByteArray -InputObject $SearchBytes
+        }
+
         $bytesBefore = if ($Context -ge 0) { $Context } else { $BeforeContext }
         $bytesAfter  = if ($Context -ge 0) { $Context } else { $AfterContext }
         $seenPaths = [System.Collections.Generic.HashSet[string]]::new()
@@ -2868,6 +2963,7 @@ function Search-CreoBinary {
                 
                 $targetOffsets = [System.Collections.Generic.List[int]]::new()
                 $searchTerms = @()
+                $matchLengths = @{}
 
                 # Determine target offsets based on the parameter set used
                 if ($PSCmdlet.ParameterSetName -eq 'DirectOffset') {
@@ -2888,16 +2984,20 @@ function Search-CreoBinary {
                     }
                 }
                 else {
-                    # SearchString
                     foreach ($term in $Pattern) {
                         if ([string]::IsNullOrEmpty($term)) { continue }
                         $needle = [System.Text.Encoding]::ASCII.GetBytes($term)
                         $searchTerms += $term
-                        
-                        if ($script:UseCSharpEngine) {
-                            $targetOffsets.AddRange([CreoNative]::FindBytePattern($bytes, $needle, $IgnoreCase.IsPresent))
+                    
+                        $hits = if ($script:UseCSharpEngine) {
+                            [CreoNative]::FindBytePattern($bytes, $needle, $IgnoreCase.IsPresent)
                         } else {
-                            $targetOffsets.AddRange((Find-BytePatternOffsets -Payload $bytes -Needle $needle))
+                            Find-BytePatternOffsets -Payload $bytes -Needle $needle
+                        }
+                    
+                        foreach ($h in $hits) {
+                            $targetOffsets.Add($h)
+                            $matchLengths[$h] = $needle.Length   # remember which term matched here
                         }
                     }
                 }
@@ -2921,7 +3021,10 @@ function Search-CreoBinary {
                     $start = [Math]::Max(0, $hit - $bytesBefore)
                     $end = [Math]::Min($bytes.Length, $hit + 1 + $bytesAfter) # +1 acts as dummy length for direct offsets
                     if ($PSCmdlet.ParameterSetName -eq 'SearchBytes') { $end = [Math]::Min($bytes.Length, $hit + $SearchBytes.Length + $bytesAfter) }
-                    elseif ($PSCmdlet.ParameterSetName -eq 'SearchString') { $end = [Math]::Min($bytes.Length, $hit + $term.Length + $bytesAfter) }
+                    elseif ($PSCmdlet.ParameterSetName -eq 'SearchString') {
+                        $len = if ($matchLengths.ContainsKey($hit)) { $matchLengths[$hit] } else { 1 }
+                        $end = [Math]::Min($bytes.Length, $hit + $len + $bytesAfter)
+                    }
                     
                     $windowBytes = $bytes[$start..($end - 1)]
 
@@ -3077,30 +3180,79 @@ function Invoke-CreoRegionAnalysis {
 function Export-CreoRegionBlob {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-        [object]$RegionSnapshot,
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object]$InputObject,
 
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory)]
         [string]$DestinationPath,
 
-        [Parameter(Mandatory=$false)]
         [int]$Padding = 32
     )
+
     process {
-        # Assuming $RegionSnapshot contains AbsoluteOffset and Length from your search
-        $startOffset = [math]::Max(0, $RegionSnapshot.AbsoluteOffset - $Padding)
-        $extractLength = $RegionSnapshot.Length + ($Padding * 2)
+        $path = if ($InputObject.PSObject.Properties['FilePath']) {
+            [string]$InputObject.FilePath
+        }
+        else {
+            # FileName alone is unsafe unless it is resolvable from CWD.
+            [string]$InputObject.FileName
+        }
 
-        # Grab the raw bytes using your existing stream resolvers
-        $rawBytes = Get-CreoStreamBytes -Path $RegionSnapshot.FilePath -Offset $startOffset -Length $extractLength
-        
-        $outFile = Join-Path -Path $DestinationPath -ChildPath "$($RegionSnapshot.StreamName)_$($RegionSnapshot.AbsoluteOffset).bin"
-        [System.IO.File]::WriteAllBytes($outFile, $rawBytes)
+        # Search-CreoBinary currently emits a formatted hex string.
+        $offsetText = [string]$InputObject.AbsoluteOffset
+        $offset = if ($offsetText -match '^0x[0-9A-Fa-f]+$') {
+            [Convert]::ToInt64($offsetText.Substring(2), 16)
+        }
+        else {
+            [Convert]::ToInt64($offsetText)
+        }
 
-        Write-Output [PSCustomObject]@{
-            ExtractedFile = $outFile
-            OriginalOffset = $RegionSnapshot.AbsoluteOffset
-            BytesWritten = $rawBytes.Length
+        $matchLength = if ($InputObject.PSObject.Properties['MatchLength']) {
+            [int]$InputObject.MatchLength
+        }
+        elseif ($InputObject.PSObject.Properties['WindowBytes']) {
+            [int]$InputObject.WindowBytes
+        }
+        else {
+            64
+        }
+
+        $startOffset = [Math]::Max(0L, $offset - $Padding)
+        $extractLength = $matchLength + (2 * $Padding)
+
+        $resolved = Resolve-CreoFileStreams -Path $path
+        $targetStream = $resolved.Streams |
+            Where-Object {
+                $offset -ge $_.PayloadStart -and
+                $offset -lt ($_.PayloadStart + $_.PayloadLength)
+            } |
+            Select-Object -First 1
+
+        $streamName = if ($targetStream) { $targetStream.Name } else { 'UnknownStream' }
+
+        $allBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $path))
+        $available = [Math]::Min($extractLength, $allBytes.Length - $startOffset)
+
+        if ($available -le 0) {
+            throw "Offset 0x{0:X8} is outside '$path'." -f $offset
+        }
+
+        $buffer = $allBytes[$startOffset..($startOffset + $available - 1)]
+
+        $null = New-Item -ItemType Directory -Path $DestinationPath -Force
+        $safeStreamName = $streamName -replace '[\\/:*?"<>|]', '_'
+        $outFile = Join-Path $DestinationPath (
+            '{0}_{1:X8}_len{2}.bin' -f $safeStreamName, $offset, $available
+        )
+
+        [System.IO.File]::WriteAllBytes($outFile, [byte[]]$buffer)
+
+        [PSCustomObject]@{
+            ExtractedFile  = $outFile
+            OriginalOffset = $offset
+            StartOffset    = $startOffset
+            BytesWritten   = $available
+            StreamName     = $streamName
         }
     }
 }
@@ -3116,41 +3268,1427 @@ function Export-CreoRegionBlob {
 #   of everywhere that specific ID is invoked.
 # =========================================================================
 function Trace-CreoPointerReference {
+    <#
+    .SYNOPSIS
+        Finds repetitions of a selected fixed-width binary token.
+
+    .DESCRIPTION
+        This is a bounded candidate-token tracer, not proof that a token is
+        a Creo pointer or object ID.
+
+        For every pipeline input, it:
+          1. Parses its absolute offset.
+          2. Reads TokenLength bytes at that offset.
+          3. Converts those bytes to the hex-string grammar accepted by
+             Find-CreoStructuralRuns.
+          4. Searches parsed streams for identical occurrences.
+          5. Emits typed objects for the results.
+
+        Identical tokens are scanned only once per invocation, even if the
+        pipeline contains many hits that begin with the same bytes.
+
+    .EXAMPLE
+        # Manually trace one known token occurrence.
+        Search-CreoBinary -Path .\models\prt0001.prt.8 `
+            -Offset 0x4F9A -Quiet |
+            Trace-CreoPointerReference -TokenLength 4 `
+                -IncludeColorDump
+
+    .EXAMPLE
+        # Trace a limited number of E3 F7 search hits.
+        $hits = Search-CreoBinary -Path .\models\prt0001.prt.8 `
+            -SearchBytes 'E3 F7' -Quiet
+
+        $hits | Trace-CreoPointerReference `
+            -TokenLength 4 `
+            -MaxInputHits 10 `
+            -MaxReferencesPerToken 50
+
+    .NOTES
+        Search-CreoBinary currently emits AbsoluteOffset as a formatted
+        string such as 0x00004F9A, so this function parses it explicitly.
+    #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-        [object]$RegionSnapshot,
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object]$InputObject,
 
-        [Parameter(Mandatory=$false)]
-        [switch]$IncludeColorDump
+        # Override FileName/FilePath in the pipeline object when needed.
+        [string]$Path,
+
+        [ValidateRange(2, 32)]
+        [int]$TokenLength = 4,
+
+        # Prevent accidental full-file rescans for thousands of generic hits.
+        [ValidateRange(1, 100000)]
+        [int]$MaxInputHits = 25,
+
+        # Prevent overwhelming output for common tokens.
+        [ValidateRange(1, 100000)]
+        [int]$MaxReferencesPerToken = 100,
+
+        # Do not emit the location from which the token was read.
+        [switch]$ExcludeSelf,
+
+        # Display a 64-byte hex dump for each emitted reference.
+        [switch]$IncludeColorDump,
+
+        # Passed to Show-CreoHexDump when -IncludeColorDump is used.
+        [ValidateRange(1, 65536)]
+        [int]$DumpLength = 64
     )
+
+    begin {
+        $processedInputHits = 0
+
+        # Keyed as: fullPath|E3 F7 1E 25
+        # A repeated token gets scanned once, not once per matching seed.
+        $seenTokens = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+        function ConvertFrom-CreoOffset {
+            param(
+                [Parameter(Mandatory)]
+                [object]$Value
+            )
+
+            if ($Value -is [byte] -or
+                $Value -is [int16] -or
+                $Value -is [int32] -or
+                $Value -is [int64] -or
+                $Value -is [uint16] -or
+                $Value -is [uint32] -or
+                $Value -is [uint64]) {
+                return [Int64]$Value
+            }
+
+            $text = ([string]$Value).Trim()
+
+            if ($text -match '^(?i:0x)([0-9a-f]+)$') {
+                return [Convert]::ToInt64($matches[1], 16)
+            }
+
+            try {
+                return [Convert]::ToInt64(
+                    $text,
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+            }
+            catch {
+                throw "Cannot interpret '$Value' as an absolute file offset."
+            }
+        }
+
+        function ConvertTo-CreoHexPattern {
+            param(
+                [Parameter(Mandatory)]
+                [byte[]]$Bytes
+            )
+
+            return (($Bytes | ForEach-Object {
+                $_.ToString('X2')
+            }) -join ' ')
+        }
+
+        function Resolve-CreoTracePath {
+            param(
+                [Parameter(Mandatory)]
+                [object]$InputObject,
+
+                [string]$PathOverride
+            )
+
+            if (-not [string]::IsNullOrWhiteSpace($PathOverride)) {
+                return (Resolve-Path -LiteralPath $PathOverride -ErrorAction Stop).Path
+            }
+
+            if ($InputObject.PSObject.Properties['FilePath'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$InputObject.FilePath)) {
+                return (Resolve-Path -LiteralPath ([string]$InputObject.FilePath) `
+                    -ErrorAction Stop).Path
+            }
+
+            if ($InputObject.PSObject.Properties['FileName'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$InputObject.FileName)) {
+                return (Resolve-Path -LiteralPath ([string]$InputObject.FileName) `
+                    -ErrorAction Stop).Path
+            }
+
+            throw (
+                "Input object has neither a usable FilePath nor FileName. " +
+                "Supply -Path explicitly or update Search-CreoBinary to emit FilePath."
+            )
+        }
+    }
+
     process {
-        # Extract the dynamic 4-byte ID discovered in the snapshot
-        $dynamicId = $RegionSnapshot.DiscoveredIdBytes 
-        
-        # Search all streams in the current file for this exact byte sequence
-        $xrefs = Find-CreoStructuralRuns -Path $RegionSnapshot.FilePath -Pattern $dynamicId
-        
-        foreach ($ref in $xrefs) {
+        if ($processedInputHits -ge $MaxInputHits) {
+            Write-Warning (
+                "MaxInputHits ($MaxInputHits) reached. " +
+                "Remaining pipeline inputs were skipped."
+            )
+            return
+        }
+
+        if (-not $InputObject.PSObject.Properties['AbsoluteOffset'] -and
+            -not $InputObject.PSObject.Properties['Offset']) {
+            throw (
+                "Input object must expose AbsoluteOffset or Offset. " +
+                "Received: $($InputObject.PSObject.TypeNames[0])"
+            )
+        }
+
+        $offsetValue = if ($InputObject.PSObject.Properties['AbsoluteOffset']) {
+            $InputObject.AbsoluteOffset
+        }
+        else {
+            $InputObject.Offset
+        }
+
+        [Int64]$sourceOffset = ConvertFrom-CreoOffset -Value $offsetValue
+        if ($sourceOffset -lt 0) {
+            throw "Negative offsets are invalid: $sourceOffset"
+        }
+
+        $resolvedPath = Resolve-CreoTracePath `
+            -InputObject $InputObject `
+            -PathOverride $Path
+
+        $fileInfo = Get-Item -LiteralPath $resolvedPath -ErrorAction Stop
+        if ($fileInfo.PSIsContainer) {
+            throw "Trace-CreoPointerReference requires a file, not a directory: $resolvedPath"
+        }
+
+        if (($sourceOffset + $TokenLength) -gt $fileInfo.Length) {
+            Write-Warning (
+                "Skipping 0x{0:X8}: a {1}-byte token would extend past " +
+                "the end of '{2}'." -f $sourceOffset, $TokenLength, $fileInfo.Name
+            )
+            return
+        }
+
+        [byte[]]$idBuffer = New-Object byte[] $TokenLength
+
+        $fileStream = [System.IO.File]::Open(
+            $resolvedPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+
+        try {
+            [void]$fileStream.Seek($sourceOffset, [System.IO.SeekOrigin]::Begin)
+
+            $totalRead = 0
+            while ($totalRead -lt $TokenLength) {
+                $read = $fileStream.Read(
+                    $idBuffer,
+                    $totalRead,
+                    $TokenLength - $totalRead
+                )
+
+                if ($read -le 0) { break }
+                $totalRead += $read
+            }
+
+            if ($totalRead -ne $TokenLength) {
+                throw (
+                    "Only read $totalRead of $TokenLength bytes at " +
+                    "0x$($sourceOffset.ToString('X8'))."
+                )
+            }
+        }
+        finally {
+            $fileStream.Dispose()
+        }
+
+        $pattern = ConvertTo-CreoHexPattern -Bytes $idBuffer
+        $tokenKey = '{0}|{1}' -f $resolvedPath, $pattern
+
+        $processedInputHits++
+
+        if (-not $seenTokens.Add($tokenKey)) {
+            Write-Verbose (
+                "Skipping duplicate candidate token '$pattern' from " +
+                "0x$($sourceOffset.ToString('X8'))."
+            )
+            return
+        }
+
+        Write-Verbose (
+            "Tracing candidate token '$pattern' from " +
+            "0x$($sourceOffset.ToString('X8')) in '$($fileInfo.Name)'."
+        )
+
+        # Find-CreoStructuralRuns expects a hex-pattern string, not [byte[]].
+        $rawXrefs = @(
+            Find-CreoStructuralRuns -Path $resolvedPath -Pattern $pattern
+        )
+
+        # A malformed stream map could make the same absolute location appear
+        # through more than one stream range. Deduplicate by numeric offset.
+        $uniqueXrefs = [System.Collections.Generic.List[object]]::new()
+        $seenReferenceOffsets = [System.Collections.Generic.HashSet[Int64]]::new()
+
+        foreach ($ref in $rawXrefs) {
+            if ($null -eq $ref) { continue }
+
+            [Int64]$referenceOffset = ConvertFrom-CreoOffset `
+                -Value $ref.AbsoluteOffset
+
+            if ($ExcludeSelf -and $referenceOffset -eq $sourceOffset) {
+                continue
+            }
+
+            if ($seenReferenceOffsets.Add($referenceOffset)) {
+                $uniqueXrefs.Add($ref)
+            }
+        }
+
+        $emitted = 0
+        foreach ($ref in $uniqueXrefs) {
+            if ($emitted -ge $MaxReferencesPerToken) {
+                Write-Warning (
+                    "Token '$pattern' had more than $MaxReferencesPerToken " +
+                    "unique references. Output was truncated."
+                )
+                break
+            }
+
+            [Int64]$referenceOffset = ConvertFrom-CreoOffset `
+                -Value $ref.AbsoluteOffset
+
+            [Int64]$relativeOffset = if (
+                $ref.PSObject.Properties['RelativeOffset']
+            ) {
+                ConvertFrom-CreoOffset -Value $ref.RelativeOffset
+            }
+            else {
+                -1
+            }
+
             $result = [PSCustomObject]@{
-                TargetStream   = $ref.StreamName
-                TargetOffset   = $ref.AbsoluteOffset
-                SourceSchema   = $RegionSnapshot.SchemaName
-                DynamicID      = $dynamicId
+                FilePath             = $resolvedPath
+                FileName             = $fileInfo.Name
+                CandidateToken       = $pattern
+                TokenLength          = $TokenLength
+
+                SourceOffset         = $sourceOffset
+                SourceOffsetHex      = ('0x{0:X8}' -f $sourceOffset)
+
+                TargetStream         = [string]$ref.Stream
+                TargetOffset         = $referenceOffset
+                TargetOffsetHex      = ('0x{0:X8}' -f $referenceOffset)
+
+                TargetRelativeOffset = $relativeOffset
+                TargetRelativeHex    = if ($relativeOffset -ge 0) {
+                    '0x{0:X8}' -f $relativeOffset
+                }
+                else {
+                    $null
+                }
+
+                MatchedBytes         = [string]$ref.MatchedBytes
+                IsSourceLocation     = ($referenceOffset -eq $sourceOffset)
             }
 
             if ($IncludeColorDump) {
-                # Pipe into your existing hex dump for immediate visual context
-                Show-CreoHexDump -Path $RegionSnapshot.FilePath -Offset $ref.AbsoluteOffset -Length 64
+                Show-CreoHexDump `
+                    -Path $resolvedPath `
+                    -Offset $referenceOffset `
+                    -Length $DumpLength
             }
 
             Write-Output $result
+            $emitted++
+        }
+    }
+}
+
+
+function Get-CreoStreamFingerprints {
+    <#
+    .SYNOPSIS
+        Produces SHA-256 fingerprints for every resolved Creo stream payload.
+
+    .DESCRIPTION
+        Accepts individual files, wildcard paths, and directories.
+
+        Uses [System.Security.Cryptography.SHA256]::Create().ComputeHash()
+        instead of [SHA256]::HashData(), making it compatible with Windows
+        PowerShell 5.1 / .NET Framework as well as PowerShell 7+.
+
+    .EXAMPLE
+        Get-CreoStreamFingerprints -Path .\models\prt0001.prt.4
+
+    .EXAMPLE
+        Get-CreoStreamFingerprints -Path '.\models\prt0001.prt.*' |
+            Sort-Object FileName, StreamName |
+            Format-Table -AutoSize
+
+    .EXAMPLE
+        # Include files inside subdirectories.
+        Get-CreoStreamFingerprints -Path .\models -Recurse |
+            Export-Csv .\stream_hashes.csv -NoTypeInformation
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Path,
+
+        [switch]$Recurse
+    )
+
+    begin {
+        $seenFiles = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+        function Get-CreoFingerprintFiles {
+            param(
+                [Parameter(Mandatory)]
+                [string[]]$InputPaths,
+
+                [switch]$IncludeRecurse
+            )
+
+            foreach ($inputPath in $InputPaths) {
+                $resolvedItems = @(
+                    Resolve-Path -Path $inputPath -ErrorAction Stop
+                )
+
+                foreach ($resolvedItem in $resolvedItems) {
+                    $item = Get-Item -LiteralPath $resolvedItem.Path `
+                        -Force `
+                        -ErrorAction Stop
+
+                    if ($item.PSIsContainer) {
+                        Get-ChildItem `
+                            -LiteralPath $item.FullName `
+                            -File `
+                            -Force `
+                            -Recurse:$IncludeRecurse
+                    }
+                    else {
+                        $item
+                    }
+                }
+            }
+        }
+    }
+
+    process {
+        $files = @(
+            Get-CreoFingerprintFiles `
+                -InputPaths $Path `
+                -IncludeRecurse:$Recurse
+        )
+
+        foreach ($file in $files) {
+            if (-not $seenFiles.Add($file.FullName)) {
+                continue
+            }
+
+            $resolved = Resolve-CreoFileStreams -Path $file.FullName
+
+            if ($null -eq $resolved -or $null -eq $resolved.Data) {
+                Write-Warning "Could not resolve streams for '$($file.FullName)'."
+                continue
+            }
+
+            [byte[]]$data = $resolved.Data
+            $streams = @($resolved.Streams)
+
+            foreach ($stream in $streams) {
+                if (-not (Test-CreoStreamRange `
+                    -Stream $stream `
+                    -FileLength $data.Length)) {
+                    Write-Verbose (
+                        "Skipping invalid stream range '$($stream.Name)' " +
+                        "in '$($file.Name)'."
+                    )
+                    continue
+                }
+
+                [Int64]$payloadStart = [Int64]$stream.PayloadStart
+                [Int64]$payloadLength = [Int64]$stream.PayloadLength
+
+                # ComputeHash overloads use Int32 offsets/counts.
+                # The current resolver also stores offsets as [int].
+                if ($payloadStart -gt [Int32]::MaxValue -or
+                    $payloadLength -gt [Int32]::MaxValue) {
+                    Write-Warning (
+                        "Skipping '$($stream.Name)' in '$($file.Name)': " +
+                        "payload range exceeds .NET Int32 hashing overload limits."
+                    )
+                    continue
+                }
+
+                $sha256 = [System.Security.Cryptography.SHA256]::Create()
+
+                try {
+                    # Hashes the exact region without copying it into a
+                    # separate $payload array.
+                    [byte[]]$hashBytes = $sha256.ComputeHash(
+                        $data,
+                        [int]$payloadStart,
+                        [int]$payloadLength
+                    )
+
+                    $hashHex = ([System.BitConverter]::ToString($hashBytes)) `
+                        -replace '-', ''
+                }
+                finally {
+                    if ($null -ne $sha256) {
+                        $sha256.Dispose()
+                    }
+                }
+
+                [PSCustomObject]@{
+                    FilePath       = $file.FullName
+                    FileName       = $file.Name
+
+                    StreamName     = [string]$stream.Name
+                    PayloadStart   = $payloadStart
+                    PayloadStartHex = ('0x{0:X8}' -f $payloadStart)
+
+                    PayloadLength  = $payloadLength
+                    PayloadEnd     = $payloadStart + $payloadLength
+                    PayloadEndHex  = (
+                        '0x{0:X8}' -f ($payloadStart + $payloadLength)
+                    )
+
+                    SHA256         = $hashHex
+
+                    # Useful context retained from Resolve-StreamRanges.
+                    Size1          = $stream.Size1
+                    Size2          = $stream.Size2
+                    Entropy        = $stream.Entropy
+                    OverheadMatches = $stream.OverheadMatches
+                }
+            }
+        }
+    }
+}
+
+
+function Compare-CreoStreamBytes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ReferencePath,
+
+        [Parameter(Mandatory)]
+        [string]$DifferencePath,
+
+        [Parameter(Mandatory)]
+        [string]$StreamName,
+
+        [ValidateRange(0, 4096)]
+        [int]$Context = 32
+    )
+
+    function Get-TargetStream {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Path,
+
+            [Parameter(Mandatory)]
+            [string]$Name
+        )
+
+        $resolved = Resolve-CreoFileStreams -Path $Path
+
+        $stream = @(
+            $resolved.Streams |
+                Where-Object Name -eq $Name |
+                Select-Object -First 1
+        )
+
+        if ($stream.Count -eq 0) {
+            throw "Stream '$Name' was not found in '$Path'."
+        }
+
+        $s = $stream[0]
+        [int]$start = $s.PayloadStart
+        [int]$length = $s.PayloadLength
+
+        if ($start -lt 0 -or $length -lt 0 -or
+            ($start + $length) -gt $resolved.Data.Length) {
+            throw "Invalid range for stream '$Name' in '$Path'."
+        }
+
+        [PSCustomObject]@{
+            Path          = (Resolve-Path -LiteralPath $Path).Path
+            FileName      = (Split-Path -Leaf $Path)
+            Stream        = $s
+            Payload       = [byte[]]$resolved.Data[$start..($start + $length - 1)]
+            PayloadStart  = $start
+            PayloadLength = $length
+        }
+    }
+
+    $left = Get-TargetStream -Path $ReferencePath -Name $StreamName
+    $right = Get-TargetStream -Path $DifferencePath -Name $StreamName
+
+    $maxLength = [Math]::Max($left.PayloadLength, $right.PayloadLength)
+    $ranges = [System.Collections.Generic.List[object]]::new()
+
+    $inRange = $false
+    $rangeStart = 0
+
+    for ($i = 0; $i -lt $maxLength; $i++) {
+        $leftExists = $i -lt $left.PayloadLength
+        $rightExists = $i -lt $right.PayloadLength
+
+        $same = $leftExists -and $rightExists -and
+            ($left.Payload[$i] -eq $right.Payload[$i])
+
+        if (-not $same -and -not $inRange) {
+            $rangeStart = $i
+            $inRange = $true
+        }
+        elseif ($same -and $inRange) {
+            $ranges.Add([PSCustomObject]@{
+                RelativeStart    = $rangeStart
+                RelativeEnd      = $i - 1
+                Length           = $i - $rangeStart
+            })
+
+            $inRange = $false
+        }
+    }
+
+    if ($inRange) {
+        $ranges.Add([PSCustomObject]@{
+            RelativeStart = $rangeStart
+            RelativeEnd   = $maxLength - 1
+            Length        = $maxLength - $rangeStart
+        })
+    }
+
+    foreach ($range in $ranges) {
+        $leftStart = [Math]::Max(0, $range.RelativeStart - $Context)
+        $rightStart = [Math]::Max(0, $range.RelativeStart - $Context)
+
+        $leftEnd = [Math]::Min(
+            $left.PayloadLength,
+            $range.RelativeEnd + 1 + $Context
+        )
+
+        $rightEnd = [Math]::Min(
+            $right.PayloadLength,
+            $range.RelativeEnd + 1 + $Context
+        )
+
+        [PSCustomObject]@{
+            StreamName          = $StreamName
+
+            ReferenceFile       = $left.FileName
+            DifferenceFile      = $right.FileName
+
+            RelativeStart       = $range.RelativeStart
+            RelativeStartHex    = ('0x{0:X8}' -f $range.RelativeStart)
+
+            ReferenceAbsolute   = $left.PayloadStart + $range.RelativeStart
+            ReferenceAbsoluteHex = (
+                '0x{0:X8}' -f ($left.PayloadStart + $range.RelativeStart)
+            )
+
+            DifferenceAbsolute  = $right.PayloadStart + $range.RelativeStart
+            DifferenceAbsoluteHex = (
+                '0x{0:X8}' -f ($right.PayloadStart + $range.RelativeStart)
+            )
+
+            DifferenceLength    = $range.Length
+
+            ReferenceContextStart = $left.PayloadStart + $leftStart
+            ReferenceBytes      = if ($leftStart -lt $leftEnd) {
+                [byte[]]$left.Payload[$leftStart..($leftEnd - 1)]
+            }
+            else {
+                [byte[]]@()
+            }
+
+            DifferenceContextStart = $right.PayloadStart + $rightStart
+            DifferenceBytes     = if ($rightStart -lt $rightEnd) {
+                [byte[]]$right.Payload[$rightStart..($rightEnd - 1)]
+            }
+            else {
+                [byte[]]@()
+            }
         }
     }
 }
 
 
 
+
+# =========================================================================
+# FUNCTION: Show-CreoStreamHashMatrix:
+# .EXAMPLE
+# Show-CreoStreamHashMatrix -Path '.\models\prt0001.prt.*'
+# 
+# Full matrix
+# 
+# 
+# .EXAMPLE
+# Show-CreoStreamHashMatrix `
+#     -Path '.\models\prt0001.prt.*' `
+#     -ChangedOnly
+# 
+# Only changed streams
+# This will be your most useful command while running the test matrix:
+# 
+# 
+# .EXAMPLE
+# Show-CreoStreamHashMatrix `
+#     -Path '.\models\prt0001.prt.[7-8]' `
+#     -BaselinePath '.\models\prt0001.prt.7' `
+#     -StreamName 'LargeText', 'NeuPrtSld', 'FeatDefs',
+#                 'FeatRefData', 'FeatDefsIndex', 'MdlStatus'
+# 
+# Parameter experiment
+# Use `.7` as the baseline and focus on currently relevant streams:
+# 
+# .EXAMPLE
+# Show-CreoStreamHashMatrix `
+#     -Path '.\models\prt0001.prt.[2-3]' `
+#     -BaselinePath '.\models\prt0001.prt.2' `
+#     -StreamName 'AllFeatur', 'FeatDefs', 'FeatRefData',
+#                 'FeatDefsIndex', 'SolidPersistTable',
+#                 'SolidPrimdata', 'NeuPrtSld',
+#                 'BasFullData', 'FullMData'
+# 
+# Geometry experiment
+# For `.2` vs `.3`, initially examine these candidates:
+# 
+# 
+# 
+# 
+# .EXAMPLE
+# $comparison = Show-CreoStreamHashMatrix `
+#     -Path '.\models\prt0001.prt.*' `
+#     -ChangedOnly `
+#     -PassThru
+# 
+# $comparison |
+#     Select-Object StreamName, Status, PresentFiles, MissingFiles,
+#                   DistinctHashes, BaselineFile, BaselineLength |
+#     Export-Csv .\prt0001_stream_hash_comparison.csv -NoTypeInformation
+# 
+# Export results
+# The display is for people; `-PassThru` makes the same comparison available as objects:
+# 
+# =========================================================================
+
+function Show-CreoStreamHashMatrix {
+    <#
+    .SYNOPSIS
+        Displays a color-coded stream-hash comparison matrix for Creo files.
+
+    .DESCRIPTION
+        Calls Get-CreoStreamFingerprints for files matched by -Path, then
+        compares every stream's SHA-256 to one baseline file.
+
+        Default baseline:
+          The earliest numeric final extension when filenames end in .N.
+          Example: prt0001.prt.1 is selected before prt0001.prt.10.
+
+        Status legend:
+          =  Green       Stream exists and hash equals the baseline hash.
+          X  Red         Stream exists but its hash differs from baseline.
+          -  Yellow      Stream does not exist in this file revision.
+          ?  DarkYellow  Baseline does not contain this stream.
+
+        This is a raw persistence-state tool. A red X means only that the
+        serialized stream changed; it does not by itself prove geometry,
+        parameter, annotation, or product-definition change.
+
+    .EXAMPLE
+        Show-CreoStreamHashMatrix -Path '.\models\prt0001.prt.*'
+
+    .EXAMPLE
+        # Show only streams that differ from the baseline or are missing.
+        Show-CreoStreamHashMatrix `
+            -Path '.\models\prt0001.prt.*' `
+            -ChangedOnly
+
+    .EXAMPLE
+        # Use revision .7 as the comparison baseline.
+        Show-CreoStreamHashMatrix `
+            -Path '.\models\prt0001.prt.*' `
+            -BaselinePath '.\models\prt0001.prt.7'
+
+    .EXAMPLE
+        # Focus on streams that currently look relevant to model definition.
+        Show-CreoStreamHashMatrix `
+            -Path '.\models\prt0001.prt.*' `
+            -StreamName 'FeatDefs', 'AllFeatur', 'NeuPrtSld',
+                        'SolidPersistTable', 'SolidPrimdata',
+                        'FeatRefData', 'FeatDefsIndex'
+
+    .EXAMPLE
+        # Capture the typed summary objects for export or later filtering.
+        $comparison = Show-CreoStreamHashMatrix `
+            -Path '.\models\prt0001.prt.*' `
+            -ChangedOnly `
+            -PassThru
+
+        $comparison | Export-Csv .\stream_comparison.csv -NoTypeInformation
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Path,
+
+        [Parameter()]
+        [string]$BaselinePath,
+
+        [Parameter()]
+        [string[]]$StreamName = '*',
+
+        [switch]$ChangedOnly,
+
+        [switch]$SameOnly,
+
+        [switch]$PassThru,
+
+        [switch]$NoColor
+    )
+
+    begin {
+        if ($ChangedOnly -and $SameOnly) {
+            throw 'Use either -ChangedOnly or -SameOnly, not both.'
+        }
+
+        function Get-CreoNaturalRevisionInfo {
+            param(
+                [Parameter(Mandatory)]
+                [string]$FileName
+            )
+
+            # Handles Creo-style versioned file names:
+            # prt0001.prt.1
+            # prt0001.prt.10
+            #
+            # Numeric sort matters because lexical sorting puts .10 before .2.
+            if ($FileName -match '\.(\d+)$') {
+                return [PSCustomObject]@{
+                    HasNumericRevision = $true
+                    Revision           = [Int64]$matches[1]
+                    SortName           = $FileName
+                }
+            }
+
+            return [PSCustomObject]@{
+                HasNumericRevision = $false
+                Revision           = [Int64]::MaxValue
+                SortName           = $FileName
+            }
+        }
+
+        function Get-CreoShortLabel {
+            param(
+                [Parameter(Mandatory)]
+                [string]$FileName
+            )
+
+            # Prefer a compact ".7" style column heading for Creo revisions.
+            if ($FileName -match '\.(\d+)$') {
+                return ".{0}" -f $matches[1]
+            }
+
+            # Fall back to a trimmed filename for non-versioned files.
+            if ($FileName.Length -gt 12) {
+                return $FileName.Substring(0, 12)
+            }
+
+            return $FileName
+        }
+
+        function Write-CreoMatrixText {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Text,
+
+                [ConsoleColor]$Color = [ConsoleColor]::Gray,
+
+                [switch]$NoNewline,
+
+                [switch]$DisableColor
+            )
+
+            if ($DisableColor) {
+                Write-Host $Text -NoNewline:$NoNewline
+            }
+            else {
+                Write-Host $Text `
+                    -ForegroundColor $Color `
+                    -NoNewline:$NoNewline
+            }
+        }
+    }
+
+    process {
+        # Get-CreoStreamFingerprints supports files, directories, and wildcards.
+        $fingerprints = @(
+            Get-CreoStreamFingerprints -Path $Path
+        )
+
+        if ($fingerprints.Count -eq 0) {
+            throw 'No stream fingerprints were produced for the supplied path(s).'
+        }
+
+        # Get a distinct, naturally sorted list of input files.
+        $files = @(
+            $fingerprints |
+                Group-Object FilePath |
+                ForEach-Object {
+                    $first = $_.Group | Select-Object -First 1
+                    $sort = Get-CreoNaturalRevisionInfo -FileName $first.FileName
+
+                    [PSCustomObject]@{
+                        FilePath       = $first.FilePath
+                        FileName       = $first.FileName
+                        Revision       = $sort.Revision
+                        HasRevision    = $sort.HasNumericRevision
+                        SortName       = $sort.SortName
+                        Label          = Get-CreoShortLabel -FileName $first.FileName
+                    }
+                } |
+                Sort-Object `
+                    @{ Expression = { -not $_.HasRevision } },
+                    @{ Expression = { $_.Revision } },
+                    @{ Expression = { $_.SortName } }
+        )
+
+        if ($files.Count -lt 2) {
+            throw (
+                'At least two files are required for a comparison. ' +
+                "Found $($files.Count)."
+            )
+        }
+
+        # Use a caller-specified baseline if supplied; otherwise use the
+        # earliest naturally sorted revision.
+        $baselineFile = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($BaselinePath)) {
+            $baselineMatches = @(
+                Resolve-Path -Path $BaselinePath -ErrorAction Stop
+            )
+
+            if ($baselineMatches.Count -ne 1) {
+                throw (
+                    "-BaselinePath must resolve to exactly one file. " +
+                    "It resolved to $($baselineMatches.Count) item(s)."
+                )
+            }
+
+            $baselineResolvedPath = $baselineMatches[0].Path
+
+            $baselineFile = @(
+                $files | Where-Object {
+                    $_.FilePath -eq $baselineResolvedPath
+                }
+            ) | Select-Object -First 1
+
+            if ($null -eq $baselineFile) {
+                throw (
+                    "Baseline '$baselineResolvedPath' is not included in " +
+                    'the files matched by -Path.'
+                )
+            }
+        }
+        else {
+            $baselineFile = $files | Select-Object -First 1
+        }
+
+        # Build a fast lookup:
+        #   <full file path>|<stream name> => fingerprint object
+        $lookup = @{}
+
+        foreach ($row in $fingerprints) {
+            $key = '{0}|{1}' -f $row.FilePath, $row.StreamName
+
+            # If the resolver somehow produces duplicate same-name streams
+            # for one file, retain the first and make it visible with Verbose.
+            if ($lookup.ContainsKey($key)) {
+                Write-Verbose (
+                    "Duplicate stream '$($row.StreamName)' in " +
+                    "'$($row.FileName)'; retaining first fingerprint."
+                )
+                continue
+            }
+
+            $lookup[$key] = $row
+        }
+
+        # Build the union of stream names across every selected file.
+        $streamNames = @(
+            $fingerprints |
+                Select-Object -ExpandProperty StreamName -Unique |
+                Where-Object {
+                    $candidate = $_
+
+                    foreach ($pattern in $StreamName) {
+                        if ($candidate -like $pattern) {
+                            return $true
+                        }
+                    }
+
+                    return $false
+                } |
+                Sort-Object
+        )
+
+        if ($streamNames.Count -eq 0) {
+            throw 'No streams matched the supplied -StreamName filter.'
+        }
+
+        $summaries = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($stream in $streamNames) {
+            $baselineKey = '{0}|{1}' -f $baselineFile.FilePath, $stream
+            $baselineRow = $lookup[$baselineKey]
+
+            $presentCount = 0
+            $sameCount = 0
+            $differentCount = 0
+            $missingCount = 0
+            $hashes = [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+
+            $perFile = @{}
+
+            foreach ($file in $files) {
+                $key = '{0}|{1}' -f $file.FilePath, $stream
+                $row = $lookup[$key]
+
+                if ($null -eq $row) {
+                    $missingCount++
+
+                    $perFile[$file.FilePath] = [PSCustomObject]@{
+                        Status = 'Missing'
+                        Symbol = '-'
+                        Color  = [ConsoleColor]::Yellow
+                        Row    = $null
+                    }
+
+                    continue
+                }
+
+                $presentCount++
+                [void]$hashes.Add([string]$row.SHA256)
+
+                if ($null -eq $baselineRow) {
+                    $perFile[$file.FilePath] = [PSCustomObject]@{
+                        Status = 'NoBaseline'
+                        Symbol = '?'
+                        Color  = [ConsoleColor]::DarkYellow
+                        Row    = $row
+                    }
+
+                    continue
+                }
+
+                if ($row.SHA256 -eq $baselineRow.SHA256) {
+                    $sameCount++
+
+                    $perFile[$file.FilePath] = [PSCustomObject]@{
+                        Status = 'Same'
+                        Symbol = '='
+                        Color  = [ConsoleColor]::Green
+                        Row    = $row
+                    }
+                }
+                else {
+                    $differentCount++
+
+                    $perFile[$file.FilePath] = [PSCustomObject]@{
+                        Status = 'Different'
+                        Symbol = 'X'
+                        Color  = [ConsoleColor]::Red
+                        Row    = $row
+                    }
+                }
+            }
+
+            $status = if ($null -eq $baselineRow) {
+                'NoBaselineStream'
+            }
+            elseif ($missingCount -gt 0) {
+                'MissingInSomeFiles'
+            }
+            elseif ($differentCount -eq 0) {
+                'SameAcrossAllFiles'
+            }
+            else {
+                'ChangedFromBaseline'
+            }
+
+            $summary = [ordered]@{
+                StreamName        = $stream
+                Status            = $status
+                PresentFiles      = $presentCount
+                TotalFiles        = $files.Count
+                MissingFiles      = $missingCount
+                DistinctHashes    = $hashes.Count
+                BaselineFile      = $baselineFile.FileName
+                BaselineLength    = if ($baselineRow) {
+                    $baselineRow.PayloadLength
+                }
+                else {
+                    $null
+                }
+                BaselineSHA256    = if ($baselineRow) {
+                    $baselineRow.SHA256
+                }
+                else {
+                    $null
+                }
+            }
+
+            foreach ($file in $files) {
+                $cell = $perFile[$file.FilePath]
+
+                # Dynamic per-file properties make -PassThru exportable.
+                $summary["$($file.Label)_Status"] = $cell.Status
+                $summary["$($file.Label)_Length"] = if ($cell.Row) {
+                    $cell.Row.PayloadLength
+                }
+                else {
+                    $null
+                }
+                $summary["$($file.Label)_SHA256"] = if ($cell.Row) {
+                    $cell.Row.SHA256
+                }
+                else {
+                    $null
+                }
+            }
+
+            $summaries.Add([PSCustomObject]$summary)
+        }
+
+        $displayRows = @(
+            foreach ($summary in $summaries) {
+                if ($ChangedOnly -and
+                    $summary.Status -eq 'SameAcrossAllFiles') {
+                    continue
+                }
+
+                if ($SameOnly -and
+                    $summary.Status -ne 'SameAcrossAllFiles') {
+                    continue
+                }
+
+                $summary
+            }
+        )
+
+        $sameStreams = @(
+            $summaries | Where-Object {
+                $_.Status -eq 'SameAcrossAllFiles'
+            }
+        ).Count
+
+        $changedStreams = @(
+            $summaries | Where-Object {
+                $_.Status -eq 'ChangedFromBaseline'
+            }
+        ).Count
+
+        $missingStreams = @(
+            $summaries | Where-Object {
+                $_.Status -eq 'MissingInSomeFiles' -or
+                $_.Status -eq 'NoBaselineStream'
+            }
+        ).Count
+
+        # -------------------------
+        # Console visualization
+        # -------------------------
+        Write-Host ''
+        Write-CreoMatrixText `
+            -Text '=== Creo Stream Hash Matrix ===' `
+            -Color Cyan `
+            -DisableColor:$NoColor
+
+        Write-Host ''
+
+        Write-CreoMatrixText `
+            -Text 'Baseline : ' `
+            -Color DarkGray `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text $baselineFile.FileName `
+            -Color White `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text 'Files    : ' `
+            -Color DarkGray `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text $files.Count `
+            -Color White `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text 'Streams  : ' `
+            -Color DarkGray `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text $summaries.Count `
+            -Color White `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text 'Same     : ' `
+            -Color DarkGray `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text $sameStreams `
+            -Color Green `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text 'Changed  : ' `
+            -Color DarkGray `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text $changedStreams `
+            -Color Red `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text 'Missing  : ' `
+            -Color DarkGray `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text $missingStreams `
+            -Color Yellow `
+            -DisableColor:$NoColor
+
+        Write-Host ''
+        Write-Host ''
+
+        Write-CreoMatrixText `
+            -Text 'Legend: ' `
+            -Color DarkGray `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text '= same  ' `
+            -Color Green `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text 'X changed  ' `
+            -Color Red `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text '- missing  ' `
+            -Color Yellow `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        Write-CreoMatrixText `
+            -Text '? no baseline stream' `
+            -Color DarkYellow `
+            -DisableColor:$NoColor
+
+        Write-Host ''
+        Write-Host ''
+
+        # Calculate widths. Limit stream-name width to keep the matrix readable.
+        $streamColumnWidth = [Math]::Max(
+            24,
+            [Math]::Min(
+                34,
+                (($displayRows | ForEach-Object {
+                    $_.StreamName.Length
+                } | Measure-Object -Maximum).Maximum)
+            )
+        )
+
+        $fileColumnWidth = 8
+
+        # Header row.
+        $streamHeaderFormat = '{0,-' + $streamColumnWidth + '}  '
+        $streamHeaderText = $streamHeaderFormat -f 'StreamName'
+
+        Write-CreoMatrixText `
+            -Text $streamHeaderText `
+            -Color Cyan `
+            -NoNewline `
+            -DisableColor:$NoColor
+
+        foreach ($file in $files) {
+            $header = $file.Label
+
+            if ($header.Length -gt $fileColumnWidth) {
+                $header = $header.Substring(0, $fileColumnWidth)
+            }
+
+            $fileHeaderFormat = '{0,' + $fileColumnWidth + '} '
+            $fileHeaderText = $fileHeaderFormat -f $header
+
+            Write-CreoMatrixText `
+                -Text $fileHeaderText `
+                -Color Cyan `
+                -NoNewline `
+                -DisableColor:$NoColor
+        }
+
+        Write-CreoMatrixText `
+            -Text '  Distinct  Status' `
+            -Color Cyan `
+            -DisableColor:$NoColor
+
+        # Separator row.
+        $separatorLength = $streamColumnWidth + 2 +
+            (($fileColumnWidth + 1) * $files.Count) + 22
+
+        Write-CreoMatrixText `
+            -Text ('-' * $separatorLength) `
+            -Color DarkGray `
+            -DisableColor:$NoColor
+
+        foreach ($summary in $displayRows) {
+            $displayName = $summary.StreamName
+
+            if ($displayName.Length -gt $streamColumnWidth) {
+                $displayName = $displayName.Substring(
+                    0,
+                    $streamColumnWidth - 1
+                ) + '…'
+            }
+
+            $nameColor = switch ($summary.Status) {
+                'SameAcrossAllFiles' { [ConsoleColor]::Green }
+                'ChangedFromBaseline' { [ConsoleColor]::Red }
+                default { [ConsoleColor]::Yellow }
+            }
+
+            $streamNameFormat = '{0,-' + $streamColumnWidth + '}  '
+            $streamNameText = $streamNameFormat -f $displayName
+
+            Write-CreoMatrixText `
+                -Text $streamNameText `
+                -Color $nameColor `
+                -NoNewline `
+                -DisableColor:$NoColor
+
+            foreach ($file in $files) {
+                $statusProperty = '{0}_Status' -f $file.Label
+                $cellStatus = $summary.$statusProperty
+
+                $symbol = switch ($cellStatus) {
+                    'Same'       { '=' }
+                    'Different'  { 'X' }
+                    'Missing'    { '-' }
+                    'NoBaseline' { '?' }
+                    default      { '?' }
+                }
+
+                $color = switch ($cellStatus) {
+                    'Same'       { [ConsoleColor]::Green }
+                    'Different'  { [ConsoleColor]::Red }
+                    'Missing'    { [ConsoleColor]::Yellow }
+                    'NoBaseline' { [ConsoleColor]::DarkYellow }
+                    default      { [ConsoleColor]::Gray }
+                }
+
+                $statusSymbolFormat = '{0,' + $fileColumnWidth + '} '
+                $statusSymbolText = $statusSymbolFormat -f $symbol
+
+                Write-CreoMatrixText `
+                    -Text $statusSymbolText `
+                    -Color $color `
+                    -NoNewline `
+                    -DisableColor:$NoColor
+            }
+
+            $statusText = switch ($summary.Status) {
+                'SameAcrossAllFiles' {
+                    'SAME'
+                }
+                'ChangedFromBaseline' {
+                    'CHANGED'
+                }
+                'MissingInSomeFiles' {
+                    'MISSING'
+                }
+                'NoBaselineStream' {
+                    'NO BASELINE'
+                }
+                default {
+                    $summary.Status
+                }
+            }
+
+            $statusColor = switch ($summary.Status) {
+                'SameAcrossAllFiles'  { [ConsoleColor]::Green }
+                'ChangedFromBaseline' { [ConsoleColor]::Red }
+                default               { [ConsoleColor]::Yellow }
+            }
+
+            $distinctHashText = '  {0,8}  ' -f $summary.DistinctHashes
+                    
+            Write-CreoMatrixText `
+                -Text $distinctHashText `
+                -Color DarkGray `
+                -NoNewline `
+                -DisableColor:$NoColor
+
+            Write-CreoMatrixText `
+                -Text $statusText `
+                -Color $statusColor `
+                -DisableColor:$NoColor
+        }
+
+        Write-Host ''
+        Write-CreoMatrixText `
+            -Text (
+                'Displayed {0} of {1} stream(s).' -f
+                $displayRows.Count,
+                $summaries.Count
+            ) `
+            -Color DarkGray `
+            -DisableColor:$NoColor
+
+        Write-Host ''
+
+        if ($PassThru) {
+            Write-Output $displayRows
+        }
+    }
+}
 
 Export-ModuleMember -Function `
     Export-CreoThumbnail, `
@@ -3184,4 +4722,6 @@ Export-ModuleMember -Function `
     Search-CreoBinary,`
     Invoke-CreoRegionAnalysis, `
     Trace-CreoPointerReference, `
-    Export-CreoRegionBlob
+    Export-CreoRegionBlob,
+    Get-CreoStreamFingerprints, `
+    Show-CreoStreamHashMatrix
