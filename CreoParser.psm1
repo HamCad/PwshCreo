@@ -5125,6 +5125,911 @@ function Get-CreoCandidatePlmHashes {
     }
 }
 
+function Get-CreoInitialInventory {
+    <#
+    .SYNOPSIS
+        Performs the initial file-level inventory crawl for Creo files.
+
+    .DESCRIPTION
+        Produces one normalized record per physical Creo file. This is the
+        primary "Files" dataset for an initial SQL import.
+
+        It intentionally does NOT decide:
+          - Which duplicate is the master
+          - Which same-name model is the correct model
+          - Whether a candidate geometry match is release-equivalent
+          - Whether a file should be deleted
+
+        It records evidence so that those decisions can be made later.
+
+    .NOTES
+        Candidate hash profiles are provisional and must remain versioned.
+
+        Do not use CandidateGeometryHash to deduplicate files when
+        CandidateGeometryProfileComplete is False. A False value means one
+        or more expected profile streams were absent from that Creo file.
+
+        Assembly files may require a different candidate profile from parts.
+        The output includes CreoObjectType so that SQL can separate profiles
+        by PRT / ASM / DRW during validation.
+
+    .EXAMPLE
+        $crawlRunId = [guid]::NewGuid().ToString()
+
+        Get-CreoInitialInventory `
+            -Path '\\EngineeringShare\Creo' `
+            -RootPath '\\EngineeringShare\Creo' `
+            -CrawlRunId $crawlRunId |
+            Export-Csv '.\initial_creo_file_inventory.csv' -NoTypeInformation
+
+    .EXAMPLE
+        Get-CreoInitialInventory `
+            -Path '\\EngineeringShare\Creo' `
+            -RootPath '\\EngineeringShare\Creo' `
+            -CreoObjectType prt, asm |
+            Format-Table FileName, CreoObjectType, CreoVersion,
+                         FileSHA256, CandidateGeometryHash -AutoSize
+
+    .EXAMPLE
+        # Inventory a specific known model history.
+        Get-CreoInitialInventory `
+            -Path '.\models\prt0001.prt.*' `
+            -RootPath '.\models'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Path,
+
+        # Use the engineering-share root here. It allows the output to retain
+        # a stable RelativePath even when files are deeply nested.
+        [string]$RootPath,
+
+        # Persist this exact ID in SQL to associate every row with one crawl.
+        [string]$CrawlRunId = ([guid]::NewGuid().ToString()),
+
+        # Core Creo model/document types for the initial pass.
+        [ValidateSet('prt', 'asm', 'drw')]
+        [string[]]$CreoObjectType = @('prt', 'asm', 'drw'),
+
+        # Recurse is enabled by default because this is intended for shared
+        # drive inventory. Set -Recurse:$false for a single folder only.
+        [bool]$Recurse = $true,
+
+        # Include filesystem hidden/system files if the current account can
+        # access them.
+        [switch]$IncludeHidden,
+
+        # Stop immediately on a parser/hash error instead of emitting a row
+        # with InventoryStatus = Error.
+        [switch]$StopOnError,
+
+        # -----------------------------------------------------------------
+        # Candidate Geometry Profile
+        #
+        # Current part-file test evidence:
+        # .7 -> .8 parameter string edit: unchanged
+        # .8 -> .9 revolve cut:           changed
+        # .9 -> .10 delete cut:            returned to .8 hash
+        #
+        # Validate further before treating as a production GeometryHash.
+        # -----------------------------------------------------------------
+        [string[]]$CandidateGeometryStreamName = @(
+            'AllFeatur',
+            'BasicText',
+            'NeuAsmSld',
+            'VisibGeom'
+        ),
+
+        # -----------------------------------------------------------------
+        # Candidate Parameter Persistence Profile
+        #
+        # Current part-file test evidence:
+        # .7 -> .8 PARAMETER_3 string edit changed these streams.
+        #
+        # This is NOT a normalized semantic parameter hash. It is a
+        # conservative candidate until your parameter extractor becomes the
+        # authoritative parameter-signature source.
+        # -----------------------------------------------------------------
+        [string[]]$CandidateParameterPersistenceStreamName = @(
+            'ActEntity',
+            'FeatDefs',
+            'FeatDefsIndex',
+            'FeatRefData',
+            'NeuPrtSld'
+        ),
+
+        # Leave empty until annotation-specific testing proves a profile.
+        [string[]]$CandidateAnnotationStreamName = @()
+    )
+
+    begin {
+        function Get-CreoRelativePath {
+            param(
+                [Parameter(Mandatory)]
+                [string]$FullPath,
+
+                [string]$ResolvedRootPath
+            )
+
+            if ([string]::IsNullOrWhiteSpace($ResolvedRootPath)) {
+                return [System.IO.Path]::GetFileName($FullPath)
+            }
+
+            $root = $ResolvedRootPath.TrimEnd('\', '/')
+            $comparison = [System.StringComparison]::OrdinalIgnoreCase
+
+            if ($FullPath.StartsWith($root, $comparison)) {
+                $relative = $FullPath.Substring($root.Length).TrimStart('\', '/')
+
+                if (-not [string]::IsNullOrWhiteSpace($relative)) {
+                    return $relative
+                }
+            }
+
+            # The file was not under RootPath. Preserve its full path rather
+            # than silently generating an incorrect relative path.
+            return $FullPath
+        }
+
+        function Get-CreoFileIdentity {
+            param(
+                [Parameter(Mandatory)]
+                [System.IO.FileInfo]$FileInfo
+            )
+
+            # Examples:
+            # prt0001.prt.8
+            # company_start_asm.asm.1
+            # some_drawing.drw.3
+            #
+            # BaseModelName is a grouping/search key only. It is NOT a unique
+            # model identity: multiple contractors can use the same names.
+            $pattern = (
+                '^(?<BaseName>.+?)\.' +
+                '(?<CreoType>prt|asm|drw)' +
+                '(?:\.(?<Version>\d+))?$'
+            )
+
+            if ($FileInfo.Name -match $pattern) {
+                $version = if ([string]::IsNullOrWhiteSpace($matches.Version)) {
+                    $null
+                }
+                else {
+                    [Int64]$matches.Version
+                }
+
+                return [PSCustomObject]@{
+                    IsCreoCandidate = $true
+                    BaseModelName   = $matches.BaseName
+                    CreoObjectType  = $matches.CreoType.ToLowerInvariant()
+                    CreoVersion     = $version
+
+                    # This is deliberately only a candidate grouping key.
+                    # It helps identify likely version families but cannot
+                    # distinguish same-named contractor/customer models.
+                    CandidateModelNameKey = (
+                        '{0}|{1}' -f
+                        $matches.BaseName.ToUpperInvariant(),
+                        $matches.CreoType.ToUpperInvariant()
+                    )
+                }
+            }
+
+            return [PSCustomObject]@{
+                IsCreoCandidate      = $false
+                BaseModelName        = $null
+                CreoObjectType       = $null
+                CreoVersion          = $null
+                CandidateModelNameKey = $null
+            }
+        }
+
+        function Get-CreoInventoryFiles {
+            param(
+                [Parameter(Mandatory)]
+                [string[]]$InputPath,
+
+                [bool]$DoRecurse,
+
+                [switch]$IncludeHiddenItems
+            )
+
+            foreach ($inputItemPath in $InputPath) {
+                $resolvedItems = @(
+                    Resolve-Path -Path $inputItemPath -ErrorAction Stop
+                )
+
+                foreach ($resolvedItem in $resolvedItems) {
+                    $item = Get-Item `
+                        -LiteralPath $resolvedItem.Path `
+                        -Force `
+                        -ErrorAction Stop
+
+                    if ($item.PSIsContainer) {
+                        Get-ChildItem `
+                            -LiteralPath $item.FullName `
+                            -File `
+                            -Force:$IncludeHiddenItems `
+                            -Recurse:$DoRecurse
+                    }
+                    else {
+                        $item
+                    }
+                }
+            }
+        }
+
+        $resolvedRootPath = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($RootPath)) {
+            $resolvedRootPath = (
+                Resolve-Path -LiteralPath $RootPath -ErrorAction Stop
+            ).Path
+        }
+
+        $seenInventoryFiles = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+        $inventoryTimestampUtc = [datetime]::UtcNow
+    }
+
+    process {
+        $inventoryFiles = @(
+            Get-CreoInventoryFiles `
+                -InputPath $Path `
+                -DoRecurse $Recurse `
+                -IncludeHiddenItems:$IncludeHidden
+        )
+
+        foreach ($inventoryFile in $inventoryFiles) {
+            if (-not $seenInventoryFiles.Add($inventoryFile.FullName)) {
+                continue
+            }
+
+            $candidateIdentity = Get-CreoFileIdentity -FileInfo $inventoryFile
+
+            if (-not $candidateIdentity.IsCreoCandidate) {
+                continue
+            }
+
+            if ($candidateIdentity.CreoObjectType -notin $CreoObjectType) {
+                continue
+            }
+
+            $candidateRelativePath = Get-CreoRelativePath `
+                -FullPath $inventoryFile.FullName `
+                -ResolvedRootPath $resolvedRootPath
+
+            # These fields are always collected, even if Creo parsing fails.
+            $candidateBaseRecord = [ordered]@{
+                CrawlRunId               = $CrawlRunId
+                CrawlTimestampUtc        = $inventoryTimestampUtc.ToString('o')
+
+                SourceRootPath           = $resolvedRootPath
+                FilePath                 = $inventoryFile.FullName
+                RelativePath             = $candidateRelativePath
+                ParentDirectory          = $inventoryFile.DirectoryName
+
+                FileName                 = $inventoryFile.Name
+                BaseModelName            = $candidateIdentity.BaseModelName
+                CandidateModelNameKey    = $candidateIdentity.CandidateModelNameKey
+
+                CreoObjectType           = $candidateIdentity.CreoObjectType
+                CreoVersion              = $candidateIdentity.CreoVersion
+
+                FileSizeBytes            = [Int64]$inventoryFile.Length
+                FileCreatedUtc           = $inventoryFile.CreationTimeUtc.ToString('o')
+                FileLastWriteUtc         = $inventoryFile.LastWriteTimeUtc.ToString('o')
+                FileAttributes           = [string]$inventoryFile.Attributes
+
+                # This identifies byte-for-byte duplicate physical files.
+                FileSHA256               = $null
+
+                # Candidate composite hashes.
+                CandidateGeometryHash                     = $null
+                CandidateGeometryProfileConfigured        = $false
+                CandidateGeometryProfileComplete          = $false
+                CandidateGeometryMissingStreams           = $null
+
+                CandidateParameterPersistenceHash         = $null
+                CandidateParameterProfileConfigured       = $false
+                CandidateParameterProfileComplete         = $false
+                CandidateParameterMissingStreams          = $null
+
+                CandidateNativeDefinitionHash             = $null
+                CandidateNativeDefinitionProfileComplete  = $false
+                CandidateNativeDefinitionMissingStreams   = $null
+
+                CandidateAnnotationHash                   = $null
+                CandidateAnnotationProfileConfigured      = $false
+                CandidateAnnotationProfileComplete        = $false
+                CandidateAnnotationMissingStreams         = $null
+
+                # Preserve profile identity in SQL. Do not overwrite a hash
+                # later without knowing which candidate rule produced it.
+                CandidateGeometryProfileVersion           = 'CandidateGeometryProfileV1'
+                CandidateParameterProfileVersion          = 'CandidateParameterPersistenceProfileV1'
+                CandidateNativeDefinitionProfileVersion   = 'CandidateNativeDefinitionProfileV1'
+                CandidateAnnotationProfileVersion         = 'CandidateAnnotationProfileV1'
+
+                InventoryStatus         = 'Pending'
+                InventoryError          = $null
+            }
+
+            try {
+                $candidateFileHash = Get-FileHash `
+                    -LiteralPath $inventoryFile.FullName `
+                    -Algorithm SHA256 `
+                    -ErrorAction Stop
+
+                $candidateBaseRecord.FileSHA256 =
+                    $candidateFileHash.Hash
+
+                # This runs the candidate PLM profiles.
+                #
+                # The existing function returns one record because this call
+                # provides exactly one physical file.
+                $candidatePlmHash = @(
+                    Get-CreoCandidatePlmHashes `
+                        -Path $inventoryFile.FullName `
+                        -CandidateGeometryStreamName `
+                            $CandidateGeometryStreamName `
+                        -CandidateParameterPersistenceStreamName `
+                            $CandidateParameterPersistenceStreamName `
+                        -CandidateAnnotationStreamName `
+                            $CandidateAnnotationStreamName `
+                        -ErrorAction Stop
+                ) | Select-Object -First 1
+
+                if ($null -eq $candidatePlmHash) {
+                    throw (
+                        'Get-CreoCandidatePlmHashes returned no result for ' +
+                        "'$($inventoryFile.FullName)'."
+                    )
+                }
+
+                $candidateBaseRecord.CandidateGeometryHash =
+                    $candidatePlmHash.CandidateGeometryHash
+
+                $candidateBaseRecord.CandidateGeometryProfileConfigured =
+                    $candidatePlmHash.CandidateGeometryProfileConfigured
+
+                $candidateBaseRecord.CandidateGeometryProfileComplete =
+                    $candidatePlmHash.CandidateGeometryProfileComplete
+
+                $candidateBaseRecord.CandidateGeometryMissingStreams =
+                    $candidatePlmHash.CandidateGeometryMissingStreams
+
+                $candidateBaseRecord.CandidateParameterPersistenceHash =
+                    $candidatePlmHash.CandidateParameterPersistenceHash
+
+                $candidateBaseRecord.CandidateParameterProfileConfigured =
+                    $candidatePlmHash.CandidateParameterProfileConfigured
+
+                $candidateBaseRecord.CandidateParameterProfileComplete =
+                    $candidatePlmHash.CandidateParameterProfileComplete
+
+                $candidateBaseRecord.CandidateParameterMissingStreams =
+                    $candidatePlmHash.CandidateParameterMissingStreams
+
+                $candidateBaseRecord.CandidateNativeDefinitionHash =
+                    $candidatePlmHash.CandidateNativeDefinitionHash
+
+                $candidateBaseRecord.CandidateNativeDefinitionProfileComplete =
+                    $candidatePlmHash.CandidateNativeDefinitionProfileComplete
+
+                $candidateBaseRecord.CandidateNativeDefinitionMissingStreams =
+                    $candidatePlmHash.CandidateNativeDefinitionMissingStreams
+
+                $candidateBaseRecord.CandidateAnnotationHash =
+                    $candidatePlmHash.CandidateAnnotationHash
+
+                $candidateBaseRecord.CandidateAnnotationProfileConfigured =
+                    $candidatePlmHash.CandidateAnnotationProfileConfigured
+
+                $candidateBaseRecord.CandidateAnnotationProfileComplete =
+                    $candidatePlmHash.CandidateAnnotationProfileComplete
+
+                $candidateBaseRecord.CandidateAnnotationMissingStreams =
+                    $candidatePlmHash.CandidateAnnotationMissingStreams
+
+                $candidateBaseRecord.InventoryStatus = 'Succeeded'
+            }
+            catch {
+                $candidateBaseRecord.InventoryStatus = 'Error'
+                $candidateBaseRecord.InventoryError = $_.Exception.Message
+
+                if ($StopOnError) {
+                    throw
+                }
+            }
+
+            [PSCustomObject]$candidateBaseRecord
+        }
+    }
+}
+
+function Get-CreoInitialStreamInventory {
+    <#
+    .SYNOPSIS
+        Produces one record per resolved stream per Creo file.
+
+    .DESCRIPTION
+        This is the child dataset for Get-CreoInitialInventory.
+
+        Suggested SQL relationship:
+            CreoFileInventory.CrawlRunId + CreoFileInventory.FilePath
+                ->
+            CreoStreamInventory.CrawlRunId + CreoStreamInventory.FilePath
+
+        Use this table to:
+          - Find streams that are identical across all versions
+          - Identify save-sensitive streams
+          - Compare PRT and ASM stream behavior
+          - Build/refine candidate profile versions
+          - Investigate candidate duplicate groups
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$CrawlRunId
+    )
+
+    process {
+        Get-CreoStreamFingerprints -Path $Path |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    CrawlRunId      = $CrawlRunId
+                    FilePath        = $_.FilePath
+                    FileName        = $_.FileName
+
+                    StreamName      = $_.StreamName
+                    PayloadStart    = $_.PayloadStart
+                    PayloadStartHex = $_.PayloadStartHex
+                    PayloadLength   = $_.PayloadLength
+                    PayloadEnd      = $_.PayloadEnd
+                    PayloadEndHex   = $_.PayloadEndHex
+
+                    StreamSHA256    = $_.SHA256
+                    Entropy         = $_.Entropy
+                    Size1           = $_.Size1
+                    Size2           = $_.Size2
+                    OverheadMatches = $_.OverheadMatches
+                }
+            }
+    }
+}
+
+function Test-CreoInitialInventory {
+    <#
+    .SYNOPSIS
+        Read-only dry run for Get-CreoInitialInventory.
+
+    .DESCRIPTION
+        This function intentionally runs the SAME inventory pipeline used by
+        Get-CreoInitialInventory. It does not independently inspect parser
+        internals or duplicate stream-resolution logic.
+
+        Therefore:
+
+            Test-CreoInitialInventory says Ready
+                <=> Get-CreoInitialInventory succeeded for that file
+
+        It does not write files, modify Creo data, create folders, export CSV,
+        or insert anything into SQL. It reads files, computes hashes, and
+        returns diagnostic objects only.
+
+    .NOTES
+        CandidateAnnotationProfileConfigured is expected to be False until an
+        annotation profile is validated. That does NOT make a file non-ready.
+
+    .EXAMPLE
+        Test-CreoInitialInventory -Path .\models -RootPath .\models -ShowAll
+
+    .EXAMPLE
+        $preflight = Test-CreoInitialInventory `
+            -Path '\\EngineeringShare\Creo' `
+            -RootPath '\\EngineeringShare\Creo' `
+            -ShowAll
+
+        $preflight |
+            Where-Object PreflightStatus -ne 'Ready' |
+            Format-List *
+
+    .EXAMPLE
+        # Only display warning/error conditions.
+        Test-CreoInitialInventory `
+            -Path .\models `
+            -RootPath .\models `
+            -ErrorsOnly
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Path,
+
+        [string]$RootPath,
+
+        [ValidateSet('prt', 'asm', 'drw')]
+        [string[]]$CreoObjectType = @('prt', 'asm', 'drw'),
+
+        [bool]$Recurse = $true,
+
+        [switch]$IncludeHidden,
+
+        # Print all successful and failed files.
+        [switch]$ShowAll,
+
+        # Print only CandidateProfileIncomplete and Error files.
+        [switch]$ErrorsOnly,
+
+        # -----------------------------------------------------------------
+        # Preserve these candidate profile parameters so preflight validates
+        # the same profile that your production crawl will use.
+        # -----------------------------------------------------------------
+        [string[]]$CandidateGeometryStreamName = @(
+            'AllFeatur',
+            'BasicText',
+            'NeuAsmSld',
+            'VisibGeom'
+        ),
+
+        [string[]]$CandidateParameterPersistenceStreamName = @(
+            'ActEntity',
+            'FeatDefs',
+            'FeatDefsIndex',
+            'FeatRefData',
+            'NeuPrtSld'
+        ),
+
+        [string[]]$CandidateAnnotationStreamName = @()
+    )
+
+    begin {
+        if ($ShowAll -and $ErrorsOnly) {
+            throw 'Use either -ShowAll or -ErrorsOnly, not both.'
+        }
+
+        function Get-CreoPreflightFiles {
+            param(
+                [Parameter(Mandatory)]
+                [string[]]$InputPath,
+
+                [bool]$DoRecurse,
+
+                [switch]$IncludeHiddenItems
+            )
+
+            foreach ($inputItemPath in $InputPath) {
+                $resolvedItems = @(
+                    Resolve-Path -Path $inputItemPath -ErrorAction Stop
+                )
+
+                foreach ($resolvedItem in $resolvedItems) {
+                    $item = Get-Item `
+                        -LiteralPath $resolvedItem.Path `
+                        -Force `
+                        -ErrorAction Stop
+
+                    if ($item.PSIsContainer) {
+                        Get-ChildItem `
+                            -LiteralPath $item.FullName `
+                            -File `
+                            -Force:$IncludeHiddenItems `
+                            -Recurse:$DoRecurse
+                    }
+                    else {
+                        $item
+                    }
+                }
+            }
+        }
+
+        function Write-CreoPreflightStatus {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Status,
+
+                [Parameter(Mandatory)]
+                [string]$FileName,
+
+                [string]$Detail
+            )
+
+            $color = switch ($Status) {
+                'Ready' {
+                    [ConsoleColor]::Green
+                }
+
+                'CandidateProfileIncomplete' {
+                    [ConsoleColor]::Yellow
+                }
+
+                'Error' {
+                    [ConsoleColor]::Red
+                }
+
+                default {
+                    [ConsoleColor]::Gray
+                }
+            }
+
+            $lineFormat = '{0,-30} {1,-38} {2}'
+            $line = $lineFormat -f $Status, $FileName, $Detail
+
+            Write-Host $line -ForegroundColor $color
+        }
+
+        $resolvedRootPath = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($RootPath)) {
+            $resolvedRootPath = (
+                Resolve-Path -LiteralPath $RootPath -ErrorAction Stop
+            ).Path
+        }
+
+        $escapedCreoTypes = @(
+            $CreoObjectType |
+                ForEach-Object {
+                    [regex]::Escape($_)
+                }
+        ) -join '|'
+
+        $creoNamePattern = (
+            '(?i)\.(?:' + $escapedCreoTypes + ')(?:\.\d+)?$'
+        )
+
+        $seenPreflightFiles =
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+
+        Write-Host ''
+        Write-Host '=== Creo Initial Inventory Preflight ===' `
+            -ForegroundColor Cyan
+
+        Write-Host (
+            'Running the same read-only hash and candidate-profile path ' +
+            'used by Get-CreoInitialInventory.'
+        ) -ForegroundColor DarkGray
+
+        Write-Host ''
+        $headerFormat = '{0,-30} {1,-38} {2}'
+        $header = $headerFormat -f 'Status', 'File', 'Detail'
+
+        Write-Host $header -ForegroundColor Cyan
+        Write-Host ('-' * 100) -ForegroundColor DarkGray
+    }
+
+    process {
+        $preflightFiles = @(
+            Get-CreoPreflightFiles `
+                -InputPath $Path `
+                -DoRecurse $Recurse `
+                -IncludeHiddenItems:$IncludeHidden
+        )
+
+        foreach ($preflightFile in $preflightFiles) {
+            if (-not $seenPreflightFiles.Add($preflightFile.FullName)) {
+                continue
+            }
+
+            if ($preflightFile.Name -notmatch $creoNamePattern) {
+                continue
+            }
+
+            try {
+                # ---------------------------------------------------------
+                # This is the key design correction:
+                #
+                # Do NOT call Resolve-CreoFileStreams separately and then
+                # attempt to inspect its internals.
+                #
+                # Instead, call the exact real inventory function used for
+                # production records. A physical file is passed directly, so
+                # this creates one read-only inventory result.
+                # ---------------------------------------------------------
+                $inventoryResult = @(
+                    Get-CreoInitialInventory `
+                        -Path $preflightFile.FullName `
+                        -RootPath $resolvedRootPath `
+                        -CreoObjectType $CreoObjectType `
+                        -Recurse:$false `
+                        -CandidateGeometryStreamName `
+                            $CandidateGeometryStreamName `
+                        -CandidateParameterPersistenceStreamName `
+                            $CandidateParameterPersistenceStreamName `
+                        -CandidateAnnotationStreamName `
+                            $CandidateAnnotationStreamName
+                ) | Select-Object -First 1
+
+                if ($null -eq $inventoryResult) {
+                    throw (
+                        'Get-CreoInitialInventory returned no inventory ' +
+                        "record for '$($preflightFile.FullName)'."
+                    )
+                }
+
+                $preflightStatus = if (
+                    $inventoryResult.InventoryStatus -ne 'Succeeded'
+                ) {
+                    'Error'
+                }
+                elseif (
+                    -not $inventoryResult.CandidateGeometryProfileComplete -or
+                    -not $inventoryResult.CandidateParameterProfileComplete -or
+                    -not $inventoryResult.CandidateNativeDefinitionProfileComplete
+                ) {
+                    # Parsing and inventory succeeded. The candidate profile
+                    # simply needs more validation or a file-type-specific
+                    # stream profile.
+                    'CandidateProfileIncomplete'
+                }
+                else {
+                    'Ready'
+                }
+
+                $preflightErrorMessage = if (
+                    $preflightStatus -eq 'Error'
+                ) {
+                    $inventoryResult.InventoryError
+                }
+                else {
+                    $null
+                }
+
+                $preflightRecord = [PSCustomObject]@{
+                    FilePath       = $inventoryResult.FilePath
+                    RelativePath   = $inventoryResult.RelativePath
+                    FileName       = $inventoryResult.FileName
+
+                    CreoObjectType = $inventoryResult.CreoObjectType
+                    CreoVersion    = $inventoryResult.CreoVersion
+                    FileSizeBytes  = $inventoryResult.FileSizeBytes
+
+                    PreflightStatus = $preflightStatus
+                    ErrorStage      = if (
+                        $preflightStatus -eq 'Error'
+                    ) {
+                        'Get-CreoInitialInventory'
+                    }
+                    else {
+                        $null
+                    }
+
+                    ErrorMessage = $preflightErrorMessage
+
+                    FileSHA256 = $inventoryResult.FileSHA256
+
+                    CandidateGeometryHash = (
+                        $inventoryResult.CandidateGeometryHash
+                    )
+
+                    CandidateGeometryComplete = (
+                        $inventoryResult.CandidateGeometryProfileComplete
+                    )
+
+                    CandidateGeometryMissingStreams = (
+                        $inventoryResult.CandidateGeometryMissingStreams
+                    )
+
+                    CandidateParameterPersistenceHash = (
+                        $inventoryResult.CandidateParameterPersistenceHash
+                    )
+
+                    CandidateParameterComplete = (
+                        $inventoryResult.CandidateParameterProfileComplete
+                    )
+
+                    CandidateParameterMissingStreams = (
+                        $inventoryResult.CandidateParameterMissingStreams
+                    )
+
+                    CandidateNativeDefinitionHash = (
+                        $inventoryResult.CandidateNativeDefinitionHash
+                    )
+
+                    CandidateNativeComplete = (
+                        $inventoryResult.CandidateNativeDefinitionProfileComplete
+                    )
+
+                    CandidateNativeMissingStreams = (
+                        $inventoryResult.CandidateNativeDefinitionMissingStreams
+                    )
+
+                    CandidateAnnotationConfigured = (
+                        $inventoryResult.CandidateAnnotationProfileConfigured
+                    )
+
+                    CandidateAnnotationComplete = (
+                        $inventoryResult.CandidateAnnotationProfileComplete
+                    )
+                }
+            }
+            catch {
+                $preflightRecord = [PSCustomObject]@{
+                    FilePath       = $preflightFile.FullName
+                    RelativePath   = $preflightFile.Name
+                    FileName       = $preflightFile.Name
+
+                    CreoObjectType = $null
+                    CreoVersion    = $null
+                    FileSizeBytes  = [Int64]$preflightFile.Length
+
+                    PreflightStatus = 'Error'
+                    ErrorStage      = 'Test-CreoInitialInventory'
+                    ErrorMessage    = $_.Exception.Message
+
+                    FileSHA256      = $null
+
+                    CandidateGeometryHash = $null
+                    CandidateGeometryComplete = $false
+                    CandidateGeometryMissingStreams = $null
+
+                    CandidateParameterPersistenceHash = $null
+                    CandidateParameterComplete = $false
+                    CandidateParameterMissingStreams = $null
+
+                    CandidateNativeDefinitionHash = $null
+                    CandidateNativeComplete = $false
+                    CandidateNativeMissingStreams = $null
+
+                    CandidateAnnotationConfigured = $false
+                    CandidateAnnotationComplete = $false
+                }
+            }
+
+            $showThisRecord = if ($ErrorsOnly) {
+                $preflightRecord.PreflightStatus -ne 'Ready'
+            }
+            elseif ($ShowAll) {
+                $true
+            }
+            else {
+                # Default behavior: show only warning/error conditions.
+                $preflightRecord.PreflightStatus -ne 'Ready'
+            }
+
+            if ($showThisRecord) {
+                $detail = switch ($preflightRecord.PreflightStatus) {
+                    'Ready' {
+                        'Inventory and candidate profiles succeeded'
+                    }
+
+                    'CandidateProfileIncomplete' {
+                        'Inventory succeeded; profile missing: {0}' -f (
+                            $preflightRecord.CandidateNativeMissingStreams
+                        )
+                    }
+
+                    'Error' {
+                        '{0}: {1}' -f `
+                            $preflightRecord.ErrorStage,
+                            $preflightRecord.ErrorMessage
+                    }
+
+                    default {
+                        'Unknown preflight state'
+                    }
+                }
+
+                Write-CreoPreflightStatus `
+                    -Status $preflightRecord.PreflightStatus `
+                    -FileName $preflightRecord.FileName `
+                    -Detail $detail
+            }
+
+            Write-Output $preflightRecord
+        }
+    }
+}
 
 Export-ModuleMember -Function `
     Export-CreoThumbnail, `
@@ -5161,4 +6066,7 @@ Export-ModuleMember -Function `
     Export-CreoRegionBlob,
     Get-CreoStreamFingerprints, `
     Show-CreoStreamHashMatrix, `
-    Get-CreoCandidatePlmHashes
+    Get-CreoCandidatePlmHashes, `
+    Get-CreoInitialInventory, `
+    Get-CreoInitialStreamInventory, `
+    Test-CreoInitialInventory
