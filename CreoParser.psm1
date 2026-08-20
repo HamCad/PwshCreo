@@ -28,12 +28,135 @@ public class CreoParameterHit {
     public string TypeName;
 }
 
+public class CreoNamedFrameHit {
+    public string Name;
+    public string Value;
+    public string TypeName;
+    public int Offset;
+}
+
+public class CreoInstanceHit {
+    public string RawName;
+    public string MarkerType;
+    public int Offset;
+}
+
+public class CreoNullTerminatedString {
+    public string Text;
+    public int EndByteIndex;
+}
+
 public class PrintableRun {
     public int Offset;
     public string Value;
 }
 
 public static class CreoNative {
+    // Ported for Get-CreoInstanceBOM.
+    // Finds E3 7B E2 and literal "name\\0" instance markers and returns
+    // the raw extracted name, marker type, and marker offset.
+    public static CreoInstanceHit[] ExtractInstanceMarkers(byte[] bytes) {
+        var results = new List<CreoInstanceHit>();
+        byte[] markerA = { 0xE3, 0x7B, 0xE2 };
+        byte[] markerB = { 0x6E, 0x61, 0x6D, 0x65, 0x00 }; // "name\\0"
+        int scanLimit = bytes.Length - 10;
+
+        for (int i = 0; i < scanLimit; i++) {
+            bool isA = true;
+            for (int j = 0; j < markerA.Length; j++) {
+                if (bytes[i + j] != markerA[j]) { isA = false; break; }
+            }
+
+            bool isB = false;
+            if (!isA) {
+                isB = true;
+                for (int j = 0; j < markerB.Length; j++) {
+                    if (bytes[i + j] != markerB[j]) { isB = false; break; }
+                }
+                if (isB && i > 0 && bytes[i - 1] == 0x5F) { isB = false; }
+            }
+
+            if (!isA && !isB) continue;
+
+            int offsetShift = isA ? 4 : markerB.Length;
+            int stringStart = i + offsetShift;
+            int stringEnd = Array.IndexOf(bytes, (byte)0, stringStart);
+
+            if (stringEnd > stringStart) {
+                string rawString = Encoding.ASCII.GetString(bytes, stringStart, stringEnd - stringStart);
+                string cleanName = rawString.Split('#')[0];
+
+                var sb = new StringBuilder();
+                bool inTag = false;
+                for (int s = 0; s < cleanName.Length; s++) {
+                    char ch = cleanName[s];
+                    if (ch == '<') { inTag = true; continue; }
+                    if (ch == '>') { inTag = false; continue; }
+                    if (!inTag) sb.Append(ch);
+                }
+
+                string cleanNameStr = sb.ToString().Trim();
+
+                bool isValid = cleanNameStr.Length > 5;
+                if (isValid) {
+                    for (int c = 0; c < cleanNameStr.Length; c++) {
+                        char ch = cleanNameStr[c];
+                        if (!((ch >= 'A' && ch <= 'Z') ||
+                              (ch >= 'a' && ch <= 'z') ||
+                              (ch >= '0' && ch <= '9') ||
+                              ch == '_' || ch == '-')) {
+                            isValid = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (isValid) {
+                    results.Add(new CreoInstanceHit {
+                        RawName = cleanNameStr,
+                        MarkerType = isA ? "E3_7B_E2" : "name_literal",
+                        Offset = i
+                    });
+                }
+
+                i = stringEnd;
+            }
+        }
+
+        return results.ToArray();
+    }
+
+    // Ported for Get-CreoVersionHistory.
+    // Matches the PowerShell Get-CreoNullTerminatedStringsFromPayloadPS
+    // behavior exactly: printable ASCII runs are retained only when
+    // terminated by 0x00; any other non-printable byte clears the run.
+    // EndByteIndex is the null terminator's index, which the PowerShell
+    // timestamp logic uses directly.
+    public static CreoNullTerminatedString[] ExtractNullTerminatedStrings(byte[] data, int minLen) {
+        var results = new List<CreoNullTerminatedString>();
+        var current = new List<byte>();
+
+        for (int i = 0; i < data.Length; i++) {
+            byte b = data[i];
+
+            if (b >= 32 && b <= 126) {
+                current.Add(b);
+            }
+            else if (b == 0x00 && current.Count >= minLen) {
+                results.Add(new CreoNullTerminatedString {
+                    Text = Encoding.ASCII.GetString(current.ToArray(), 0, current.Count),
+                    EndByteIndex = i
+                });
+                current.Clear();
+            }
+            else {
+                current.Clear();
+            }
+        }
+
+        return results.ToArray();
+    }
+
     public static int[] FindBytePattern(byte[] source, byte[] pattern, bool ignoreCase) {
         var offsets = new List<int>();
         if (source == null || pattern == null || pattern.Length == 0 || source.Length < pattern.Length)
@@ -251,6 +374,96 @@ public static class CreoNative {
         }
         return results.ToArray();
     }
+    // Same E1 E1 [00|01] E3 <name>\0 E2 <typeByte> ... frame as
+    // ExtractParameters above, but matched against a caller-supplied set
+    // of exact names instead of the ALL-CAPS-only validName filter.
+    // Needed for internal Creo fields like "ConfigName" that are
+    // mixed-case and silently fail that filter - not an error, just
+    // never a hit. Built for BOM extraction: enclosure.asm.5 showed
+    // "ConfigName" repeating once per component instance, String value =
+    // component name. See the validation-status note above this file
+    // before trusting Quantity on files you haven't checked by hand.
+    public static CreoNamedFrameHit[] ExtractNamedFrames(byte[] bytes, string[] targetNames) {
+        var results = new List<CreoNamedFrameHit>();
+        var targets = new HashSet<string>(targetNames, StringComparer.Ordinal);
+        int scanLimit = bytes.Length - 12;
+
+        for (int i = 0; i < scanLimit; i++) {
+            if (bytes[i] != 0xE1 || bytes[i + 1] != 0xE1) continue;
+
+            bool isPart = bytes[i + 2] == 0x00 && bytes[i + 3] == 0xE3;
+            bool isAsm  = bytes[i + 2] == 0x01 && bytes[i + 3] == 0xE3;
+            if (!isPart && !isAsm) continue;
+
+            int nameStart = i + 4;
+            int nameEnd = Array.IndexOf(bytes, (byte)0, nameStart);
+            if (nameEnd <= nameStart) continue;
+
+            string name = Encoding.ASCII.GetString(bytes, nameStart, nameEnd - nameStart);
+            if (!targets.Contains(name)) continue;
+
+            int typeMarkerStart = nameEnd + 1;
+            if (typeMarkerStart + 1 >= bytes.Length) continue;
+            int typeHex = (bytes[typeMarkerStart] << 8) | bytes[typeMarkerStart + 1];
+
+            string typeName = "Unknown";
+            switch (typeHex) {
+                case 0xE232: typeName = "Real"; break;
+                case 0xE233: typeName = "String"; break;
+                case 0xE234: typeName = "Integer"; break;
+                case 0xE235: typeName = "Boolean"; break;
+            }
+
+            int valueStart = typeMarkerStart + 2;
+            string value = null;
+            int jumpIndex = valueStart;
+
+            // Same empty-string-safe extraction as ExtractParameters -
+            // see the NOTE above ExtractParameters for why this matters
+            // (REFERENCE_3..REFERENCE_6 empty-value bug).
+            if (valueStart < bytes.Length) {
+                switch (typeName) {
+                    case "Boolean":
+                        if (valueStart + 3 < bytes.Length) {
+                            value = bytes[valueStart] == 0x01 ? "YES" : "NO";
+                            jumpIndex = valueStart + 4;
+                        }
+                        break;
+                    case "Integer":
+                        if (valueStart + 7 < bytes.Length) {
+                            value = "(Integer - raw payload not decoded)";
+                            jumpIndex = valueStart + 8;
+                        }
+                        break;
+                    case "Real":
+                        if (valueStart + 7 < bytes.Length) {
+                            value = "(Real - raw payload not decoded)";
+                            jumpIndex = valueStart + 8;
+                        }
+                        break;
+                    case "String":
+                        if (bytes[valueStart] == 0x00) {
+                            value = "";
+                            jumpIndex = valueStart + 1;
+                        }
+                        else {
+                            int valueEnd = Array.IndexOf(bytes, (byte)0, valueStart);
+                            if (valueEnd > valueStart) {
+                                value = Encoding.ASCII.GetString(bytes, valueStart, valueEnd - valueStart);
+                                jumpIndex = valueEnd;
+                            }
+                        }
+                        break;
+                }
+            }
+
+            if (value != null) {
+                results.Add(new CreoNamedFrameHit { Name = name, Value = value, TypeName = typeName, Offset = i });
+            }
+            i = Math.Max(i, jumpIndex);
+        }
+        return results.ToArray();
+    }        
 }
 "@
     try {
@@ -733,6 +946,53 @@ function ConvertTo-HexString {
     return (($Bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
 }
 
+# function ConvertTo-HexString {
+#     [CmdletBinding()]
+#     param(
+#         [AllowNull()]
+#         [byte[]]$Bytes
+#     )
+# 
+#     if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+#         return ''
+#     }
+# 
+#     return (($Bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+# }
+
+
+function ConvertFrom-HexString {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$HexString
+    )
+
+    # Allows spaces, commas, colons, hyphens, and 0x prefixes.
+    $normalized = $HexString -replace '(?i)0x', ''
+    $normalized = $normalized -replace '[^0-9A-Fa-f]', ''
+
+    if ($normalized.Length -eq 0) {
+        throw "No hexadecimal bytes were found in '$HexString'."
+    }
+
+    if (($normalized.Length % 2) -ne 0) {
+        throw "Hexadecimal input must contain complete byte pairs. Received '$HexString'."
+    }
+
+    [byte[]]$bytes = for ($i = 0; $i -lt $normalized.Length; $i += 2) {
+        try {
+            [Convert]::ToByte($normalized.Substring($i, 2), 16)
+        }
+        catch {
+            throw "Invalid hex byte at position $i in '$HexString': $($_.Exception.Message)"
+        }
+    }
+
+    return $bytes
+}
+
 function ConvertTo-AsciiString {
     param([byte[]]$Bytes)
     if (-not $Bytes -or $Bytes.Length -eq 0) { return "" }
@@ -834,8 +1094,14 @@ function Find-BytePatternOffsets {
 function Get-CreoMarkerStatistics {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        # Supports strings, byte arrays, or marker objects with Name + Bytes.
         [object[]]$Markers = $script:DefaultCreoMarkers,
+
+        [ValidateRange(0, [int]::MaxValue)]
         [int]$EntropyWindow = 16
     )
 
@@ -843,35 +1109,106 @@ function Get-CreoMarkerStatistics {
     $Data = $resolved.Data
     $streams = $resolved.Streams
 
-    $results = New-Object System.Collections.Generic.List[object]
+    $results = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($m in $Markers) {
-        $needle = [byte[]]$m.Bytes
+    foreach ($marker in $Markers) {
+        if ($null -eq $marker) {
+            Write-Warning 'Skipping a null marker.'
+            continue
+        }
+
+        # Normalize every supported marker form to:
+        # $markerName = display label
+        # $needle     = byte[] pattern
+        if ($marker -is [string]) {
+            $markerName = $marker
+            [byte[]]$needle = ConvertFrom-HexString -HexString $marker
+        }
+        elseif ($marker -is [byte[]]) {
+            [byte[]]$needle = $marker
+            $markerName = ConvertTo-HexString -Bytes $needle
+        }
+        elseif ($null -ne $marker.PSObject.Properties['Bytes']) {
+            [byte[]]$needle = $marker.Bytes
+
+            if ([string]::IsNullOrWhiteSpace([string]$marker.Name)) {
+                $markerName = ConvertTo-HexString -Bytes $needle
+            }
+            else {
+                $markerName = [string]$marker.Name
+            }
+        }
+        else {
+            throw (
+                "Unsupported marker type '$($marker.GetType().FullName)'. " +
+                "Use a hexadecimal string, [byte[]], or an object with a Bytes property."
+            )
+        }
+
+        if ($null -eq $needle -or $needle.Length -eq 0) {
+            throw "Marker '$markerName' resolved to an empty byte pattern."
+        }
+
         $totalCount = 0
-        $distinctStreams = New-Object System.Collections.Generic.HashSet[string]
-        $entropies = New-Object System.Collections.Generic.List[double]
+        $distinctStreams = [System.Collections.Generic.HashSet[string]]::new()
+        $entropies = [System.Collections.Generic.List[double]]::new()
 
         foreach ($stream in $streams) {
-            [byte[]]$payload = $Data[$stream.PayloadStart..($stream.PayloadStart + $stream.PayloadLength - 1)]
+            if ($stream.PayloadLength -le 0) {
+                continue
+            }
+
+            $payloadStart = [int]$stream.PayloadStart
+            $payloadLength = [int]$stream.PayloadLength
+            $payloadEnd = $payloadStart + $payloadLength - 1
+
+            # Avoid invalid array ranges when a malformed stream points outside Data.
+            if ($payloadStart -lt 0 -or $payloadEnd -ge $Data.Length) {
+                Write-Warning (
+                    "Skipping stream '$($stream.Name)': payload range " +
+                    "$payloadStart..$payloadEnd is outside the data buffer."
+                )
+                continue
+            }
+
+            [byte[]]$payload = $Data[$payloadStart..$payloadEnd]
+
+            if ($payload.Length -lt $needle.Length) {
+                continue
+            }
+
             $offsets = Find-BytePatternOffsets -Payload $payload -Needle $needle
 
             foreach ($off in $offsets) {
                 $totalCount++
-                [void]$distinctStreams.Add($stream.Name)
+                [void]$distinctStreams.Add([string]$stream.Name)
 
                 $wStart = [Math]::Max(0, $off - $EntropyWindow)
-                $wEnd = [Math]::Min($payload.Length - 1, $off + $needle.Length - 1 + $EntropyWindow)
+                $wEnd = [Math]::Min(
+                    $payload.Length - 1,
+                    $off + $needle.Length - 1 + $EntropyWindow
+                )
+
                 if ($wEnd -ge $wStart) {
-                    $entropies.Add((Get-Entropy -Data $payload[$wStart..$wEnd]))
+                    [byte[]]$entropyData = $payload[$wStart..$wEnd]
+                    $entropies.Add((Get-Entropy -Data $entropyData))
                 }
             }
         }
 
-        $avgEntropy = if ($entropies.Count -gt 0) { [Math]::Round(($entropies | Measure-Object -Average).Average, 3) } else { 0.0 }
+        $avgEntropy = if ($entropies.Count -gt 0) {
+            [Math]::Round(
+                ($entropies | Measure-Object -Average).Average,
+                3
+            )
+        }
+        else {
+            0.0
+        }
 
         $results.Add([PSCustomObject]@{
-            Marker          = $m.Name
-            Pattern         = ConvertTo-HexString $needle
+            Marker          = $markerName
+            Pattern         = ConvertTo-HexString -Bytes $needle
             Count           = $totalCount
             DistinctStreams = $distinctStreams.Count
             AvgEntropy      = $avgEntropy
@@ -6031,6 +6368,1465 @@ function Test-CreoInitialInventory {
     }
 }
 
+function Show-CreoHexDumpEx {
+    [CmdletBinding(DefaultParameterSetName = 'File')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'File')]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter(ParameterSetName = 'File')]
+        [string]$StreamName,
+
+        # Absolute file offset. Cannot be combined with -RelativeOffset.
+        [Parameter(ParameterSetName = 'File')]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$Offset,
+
+        # Offset from the beginning of -StreamName's payload.
+        [Parameter(ParameterSetName = 'File')]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$RelativeOffset,
+
+        [Parameter(Mandatory, ParameterSetName = 'Bytes')]
+        [ValidateNotNullOrEmpty()]
+        [byte[]]$Bytes,
+
+        [Parameter(ParameterSetName = 'Bytes')]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$BaseOffset = 0,
+
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$Length = 256,
+
+        [object]$MarkerBytes = @(
+            0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7,
+            0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF
+        ),
+
+        [ValidateRange(1, 64)]
+        [int]$BytesPerRow = 16,
+
+        [switch]$NoColor
+    )
+
+    begin {
+        [byte[]]$markerArray = ConvertTo-CreoByteArray -InputObject $MarkerBytes
+        $markerSet = [System.Collections.Generic.HashSet[byte]]::new()
+
+        foreach ($marker in $markerArray) {
+            [void]$markerSet.Add([byte]$marker)
+        }
+
+        function Write-HexCell {
+            param(
+                [Parameter(Mandatory)]
+                [byte]$Byte,
+
+                [Parameter(Mandatory)]
+                [System.Collections.Generic.HashSet[byte]]$MarkerSet,
+
+                [switch]$DisableColor
+            )
+
+            $hex = '{0:X2}' -f $Byte
+
+            if ($DisableColor) {
+                Write-Host $hex -NoNewline
+            }
+            elseif ($MarkerSet.Contains($Byte)) {
+                Write-Host $hex -ForegroundColor Yellow -NoNewline
+            }
+            elseif ($Byte -eq 0x00) {
+                Write-Host $hex -ForegroundColor DarkGray -NoNewline
+            }
+            elseif ($Byte -ge 0x20 -and $Byte -le 0x7E) {
+                Write-Host $hex -ForegroundColor Green -NoNewline
+            }
+            else {
+                Write-Host $hex -ForegroundColor White -NoNewline
+            }
+        }
+
+        function Write-AsciiCell {
+            param(
+                [Parameter(Mandatory)]
+                [byte]$Byte,
+
+                [Parameter(Mandatory)]
+                [System.Collections.Generic.HashSet[byte]]$MarkerSet,
+
+                [switch]$DisableColor
+            )
+
+            $character = if ($Byte -ge 0x20 -and $Byte -le 0x7E) {
+                [char]$Byte
+            }
+            else {
+                '.'
+            }
+
+            if ($DisableColor) {
+                Write-Host $character -NoNewline
+            }
+            elseif ($MarkerSet.Contains($Byte)) {
+                Write-Host $character -ForegroundColor Yellow -NoNewline
+            }
+            elseif ($Byte -eq 0x00) {
+                Write-Host $character -ForegroundColor DarkGray -NoNewline
+            }
+            elseif ($Byte -ge 0x20 -and $Byte -le 0x7E) {
+                Write-Host $character -ForegroundColor Green -NoNewline
+            }
+            else {
+                Write-Host $character -ForegroundColor White -NoNewline
+            }
+        }
+    }
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'Bytes') {
+            [byte[]]$data = $Bytes
+            [int]$displayBase = $BaseOffset
+        }
+        else {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+                throw "File not found: $Path"
+            }
+
+            $resolved = Resolve-CreoFileStreams -Path $Path
+            [byte[]]$fileData = $resolved.Data
+
+            $hasAbsoluteOffset = $PSBoundParameters.ContainsKey('Offset')
+            $hasRelativeOffset = $PSBoundParameters.ContainsKey('RelativeOffset')
+
+            if ($hasAbsoluteOffset -and $hasRelativeOffset) {
+                throw 'Specify either -Offset (absolute) or -RelativeOffset (stream-relative), not both.'
+            }
+
+            $stream = $null
+            if (-not [string]::IsNullOrWhiteSpace($StreamName)) {
+                $stream = $resolved.Streams |
+                    Where-Object { $_.Name -eq $StreamName } |
+                    Select-Object -First 1
+
+                if ($null -eq $stream) {
+                    throw "Stream '$StreamName' was not found."
+                }
+            }
+
+            if ($hasRelativeOffset) {
+                if ($null -eq $stream) {
+                    throw '-RelativeOffset requires -StreamName.'
+                }
+
+                [int]$payloadStart = $stream.PayloadStart
+                [int]$payloadLength = $stream.PayloadLength
+                [int]$payloadEndExclusive = $payloadStart + $payloadLength
+
+                if ($RelativeOffset -ge $payloadLength) {
+                    throw (
+                        "Relative offset 0x$($RelativeOffset.ToString('X')) exceeds " +
+                        "stream '$StreamName' length 0x$($payloadLength.ToString('X'))."
+                    )
+                }
+
+                [int]$start = $payloadStart + $RelativeOffset
+                [int]$endExclusive = [Math]::Min(
+                    $payloadEndExclusive,
+                    $start + $Length
+                )
+            }
+            elseif ($hasAbsoluteOffset) {
+                [int]$start = $Offset
+
+                if ($start -ge $fileData.Length) {
+                    throw (
+                        "Absolute offset 0x$($start.ToString('X8')) is outside " +
+                        "the file length 0x$($fileData.Length.ToString('X8'))."
+                    )
+                }
+
+                # If a stream was specified, constrain output to its payload.
+                if ($null -ne $stream) {
+                    [int]$payloadStart = $stream.PayloadStart
+                    [int]$payloadEndExclusive = $payloadStart + [int]$stream.PayloadLength
+
+                    if ($start -lt $payloadStart -or $start -ge $payloadEndExclusive) {
+                        throw (
+                            "Absolute offset 0x$($start.ToString('X8')) is outside " +
+                            "stream '$StreamName' payload range " +
+                            "0x$($payloadStart.ToString('X8'))..0x$(($payloadEndExclusive - 1).ToString('X8'))."
+                        )
+                    }
+
+                    [int]$endExclusive = [Math]::Min(
+                        $payloadEndExclusive,
+                        $start + $Length
+                    )
+                }
+                else {
+                    [int]$endExclusive = [Math]::Min(
+                        $fileData.Length,
+                        $start + $Length
+                    )
+                }
+            }
+            elseif ($null -ne $stream) {
+                [int]$start = $stream.PayloadStart
+                [int]$payloadEndExclusive = $start + [int]$stream.PayloadLength
+                [int]$endExclusive = [Math]::Min(
+                    $payloadEndExclusive,
+                    $start + $Length
+                )
+            }
+            else {
+                [int]$start = 0
+                [int]$endExclusive = [Math]::Min($fileData.Length, $Length)
+            }
+
+            if ($endExclusive -le $start) {
+                throw 'The requested hex-dump window is empty.'
+            }
+
+            [byte[]]$data = $fileData[$start..($endExclusive - 1)]
+            [int]$displayBase = $start
+        }
+
+        Write-Host ''
+        Write-Host 'Legend: ' -NoNewline
+        Write-Host 'Marker' -ForegroundColor Yellow -NoNewline
+        Write-Host '  ' -NoNewline
+        Write-Host 'Printable ASCII' -ForegroundColor Green -NoNewline
+        Write-Host '  ' -NoNewline
+        Write-Host '00 / Null' -ForegroundColor DarkGray -NoNewline
+        Write-Host '  Other' -ForegroundColor White
+        Write-Host ''
+
+        for ($rowStart = 0; $rowStart -lt $data.Length; $rowStart += $BytesPerRow) {
+            $rowLength = [Math]::Min($BytesPerRow, $data.Length - $rowStart)
+
+            Write-Host ('{0:X8}  ' -f ($displayBase + $rowStart)) -ForegroundColor DarkCyan -NoNewline
+
+            for ($column = 0; $column -lt $BytesPerRow; $column++) {
+                if ($column -lt $rowLength) {
+                    Write-HexCell -Byte $data[$rowStart + $column] `
+                        -MarkerSet $markerSet `
+                        -DisableColor:$NoColor
+                    Write-Host ' ' -NoNewline
+                }
+                else {
+                    Write-Host '   ' -NoNewline
+                }
+            }
+
+            Write-Host ' |' -NoNewline
+
+            for ($column = 0; $column -lt $rowLength; $column++) {
+                Write-AsciiCell -Byte $data[$rowStart + $column] `
+                    -MarkerSet $markerSet `
+                    -DisableColor:$NoColor
+            }
+
+            Write-Host '|'
+        }
+
+        Write-Host ''
+    }
+}
+
+function Show-CreoHexDumpPatternEx {
+    [CmdletBinding(DefaultParameterSetName = 'File')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'File')]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter(ParameterSetName = 'File')]
+        [string]$StreamName,
+
+        [Parameter(ParameterSetName = 'File')]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$Offset,
+
+        [Parameter(ParameterSetName = 'File')]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$RelativeOffset,
+
+        [Parameter(Mandatory, ParameterSetName = 'Bytes')]
+        [ValidateNotNullOrEmpty()]
+        [byte[]]$Bytes,
+
+        [Parameter(ParameterSetName = 'Bytes')]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$BaseOffset = 0,
+
+        [Parameter(Mandatory)]
+        [object]$Pattern,
+
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$Length = 256,
+
+        [ValidateRange(1, 64)]
+        [int]$BytesPerRow = 16,
+
+        [switch]$NoOverlap,
+
+        [switch]$NoColor
+    )
+
+    begin {
+        [byte[]]$needle = ConvertTo-CreoByteArray -InputObject $Pattern
+
+        if ($needle.Length -eq 0) {
+            throw '-Pattern cannot resolve to an empty byte sequence.'
+        }
+
+        function Get-PatternByteIndexes {
+            param(
+                [Parameter(Mandatory)]
+                [byte[]]$Data,
+
+                [Parameter(Mandatory)]
+                [byte[]]$Needle,
+
+                [switch]$DisableOverlap
+            )
+
+            $indexes = [System.Collections.Generic.HashSet[int]]::new()
+
+            if ($Data.Length -lt $Needle.Length) {
+                return $indexes
+            }
+
+            for ($i = 0; $i -le ($Data.Length - $Needle.Length); $i++) {
+                $match = $true
+
+                for ($j = 0; $j -lt $Needle.Length; $j++) {
+                    if ($Data[$i + $j] -ne $Needle[$j]) {
+                        $match = $false
+                        break
+                    }
+                }
+
+                if ($match) {
+                    for ($j = 0; $j -lt $Needle.Length; $j++) {
+                        [void]$indexes.Add($i + $j)
+                    }
+
+                    if ($DisableOverlap) {
+                        $i += $Needle.Length - 1
+                    }
+                }
+            }
+
+            return $indexes
+        }
+
+        function Write-PatternHexCell {
+            param(
+                [Parameter(Mandatory)]
+                [byte]$Byte,
+
+                [Parameter(Mandatory)]
+                [bool]$IsPatternByte,
+
+                [switch]$DisableColor
+            )
+
+            $hex = '{0:X2}' -f $Byte
+
+            if ($DisableColor) {
+                Write-Host $hex -NoNewline
+            }
+            elseif ($IsPatternByte) {
+                Write-Host $hex -ForegroundColor Magenta -BackgroundColor DarkMagenta -NoNewline
+            }
+            elseif ($Byte -eq 0x00) {
+                Write-Host $hex -ForegroundColor DarkGray -NoNewline
+            }
+            elseif ($Byte -ge 0x20 -and $Byte -le 0x7E) {
+                Write-Host $hex -ForegroundColor Green -NoNewline
+            }
+            else {
+                Write-Host $hex -ForegroundColor White -NoNewline
+            }
+        }
+
+        function Write-PatternAsciiCell {
+            param(
+                [Parameter(Mandatory)]
+                [byte]$Byte,
+
+                [Parameter(Mandatory)]
+                [bool]$IsPatternByte,
+
+                [switch]$DisableColor
+            )
+
+            $character = if ($Byte -ge 0x20 -and $Byte -le 0x7E) {
+                [char]$Byte
+            }
+            else {
+                '.'
+            }
+
+            if ($DisableColor) {
+                Write-Host $character -NoNewline
+            }
+            elseif ($IsPatternByte) {
+                Write-Host $character -ForegroundColor Magenta -BackgroundColor DarkMagenta -NoNewline
+            }
+            elseif ($Byte -eq 0x00) {
+                Write-Host $character -ForegroundColor DarkGray -NoNewline
+            }
+            elseif ($Byte -ge 0x20 -and $Byte -le 0x7E) {
+                Write-Host $character -ForegroundColor Green -NoNewline
+            }
+            else {
+                Write-Host $character -ForegroundColor White -NoNewline
+            }
+        }
+    }
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'Bytes') {
+            [byte[]]$data = $Bytes
+            [int]$displayBase = $BaseOffset
+        }
+        else {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+                throw "File not found: $Path"
+            }
+
+            $resolved = Resolve-CreoFileStreams -Path $Path
+            [byte[]]$fileData = $resolved.Data
+
+            $hasAbsoluteOffset = $PSBoundParameters.ContainsKey('Offset')
+            $hasRelativeOffset = $PSBoundParameters.ContainsKey('RelativeOffset')
+
+            if ($hasAbsoluteOffset -and $hasRelativeOffset) {
+                throw 'Specify either -Offset or -RelativeOffset, not both.'
+            }
+
+            $stream = $null
+            if (-not [string]::IsNullOrWhiteSpace($StreamName)) {
+                $stream = $resolved.Streams |
+                    Where-Object { $_.Name -eq $StreamName } |
+                    Select-Object -First 1
+
+                if ($null -eq $stream) {
+                    throw "Stream '$StreamName' was not found."
+                }
+            }
+
+            if ($hasRelativeOffset) {
+                if ($null -eq $stream) {
+                    throw '-RelativeOffset requires -StreamName.'
+                }
+
+                [int]$streamStart = $stream.PayloadStart
+                [int]$streamLength = $stream.PayloadLength
+
+                if ($RelativeOffset -ge $streamLength) {
+                    throw "Relative offset 0x$($RelativeOffset.ToString('X')) is outside stream '$StreamName'."
+                }
+
+                [int]$start = $streamStart + $RelativeOffset
+                [int]$endExclusive = [Math]::Min(
+                    $streamStart + $streamLength,
+                    $start + $Length
+                )
+            }
+            elseif ($hasAbsoluteOffset) {
+                [int]$start = $Offset
+
+                if ($start -ge $fileData.Length) {
+                    throw "Absolute offset 0x$($start.ToString('X8')) is outside the file."
+                }
+
+                if ($null -ne $stream) {
+                    [int]$streamStart = $stream.PayloadStart
+                    [int]$streamEndExclusive = $streamStart + [int]$stream.PayloadLength
+
+                    if ($start -lt $streamStart -or $start -ge $streamEndExclusive) {
+                        throw "Absolute offset 0x$($start.ToString('X8')) is outside stream '$StreamName'."
+                    }
+
+                    [int]$endExclusive = [Math]::Min(
+                        $streamEndExclusive,
+                        $start + $Length
+                    )
+                }
+                else {
+                    [int]$endExclusive = [Math]::Min(
+                        $fileData.Length,
+                        $start + $Length
+                    )
+                }
+            }
+            elseif ($null -ne $stream) {
+                [int]$start = $stream.PayloadStart
+                [int]$endExclusive = [Math]::Min(
+                    $start + [int]$stream.PayloadLength,
+                    $start + $Length
+                )
+            }
+            else {
+                [int]$start = 0
+                [int]$endExclusive = [Math]::Min($fileData.Length, $Length)
+            }
+
+            if ($endExclusive -le $start) {
+                throw 'The requested dump range is empty.'
+            }
+
+            [byte[]]$data = $fileData[$start..($endExclusive - 1)]
+            [int]$displayBase = $start
+        }
+
+        $patternIndexes = Get-PatternByteIndexes `
+            -Data $data `
+            -Needle $needle `
+            -DisableOverlap:$NoOverlap
+
+        Write-Host ''
+        Write-Host 'Legend: ' -NoNewline
+        Write-Host ('Exact pattern: {0}' -f (ConvertTo-HexString $needle)) `
+            -ForegroundColor Magenta -NoNewline
+        Write-Host '  Printable ASCII' -ForegroundColor Green -NoNewline
+        Write-Host '  00 / Null' -ForegroundColor DarkGray
+        Write-Host ''
+
+        for ($rowStart = 0; $rowStart -lt $data.Length; $rowStart += $BytesPerRow) {
+            $rowLength = [Math]::Min($BytesPerRow, $data.Length - $rowStart)
+
+            Write-Host ('{0:X8}  ' -f ($displayBase + $rowStart)) -ForegroundColor DarkCyan -NoNewline
+
+            for ($column = 0; $column -lt $BytesPerRow; $column++) {
+                if ($column -lt $rowLength) {
+                    $index = $rowStart + $column
+
+                    Write-PatternHexCell `
+                        -Byte $data[$index] `
+                        -IsPatternByte $patternIndexes.Contains($index) `
+                        -DisableColor:$NoColor
+
+                    Write-Host ' ' -NoNewline
+                }
+                else {
+                    Write-Host '   ' -NoNewline
+                }
+            }
+
+            Write-Host ' |' -NoNewline
+
+            for ($column = 0; $column -lt $rowLength; $column++) {
+                $index = $rowStart + $column
+
+                Write-PatternAsciiCell `
+                    -Byte $data[$index] `
+                    -IsPatternByte $patternIndexes.Contains($index) `
+                    -DisableColor:$NoColor
+            }
+
+            Write-Host '|'
+        }
+
+        Write-Host ''
+    }
+}
+
+function Find-CreoBytePatternOffsetsEx {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [byte[]]$Payload,
+
+        [Parameter(Mandatory)]
+        [object]$Pattern,
+
+        [switch]$NoOverlap
+    )
+
+    [byte[]]$needle = ConvertTo-CreoByteArray -InputObject $Pattern
+
+    if ($null -eq $Payload -or $Payload.Length -eq 0) {
+        return [int[]]@()
+    }
+
+    if ($needle.Length -eq 0) {
+        throw '-Pattern resolved to an empty byte sequence.'
+    }
+
+    if ($needle.Length -gt $Payload.Length) {
+        return [int[]]@()
+    }
+
+    $offsets = [System.Collections.Generic.List[int]]::new()
+
+    for ($i = 0; $i -le ($Payload.Length - $needle.Length); $i++) {
+        $match = $true
+
+        for ($j = 0; $j -lt $needle.Length; $j++) {
+            if ($Payload[$i + $j] -ne $needle[$j]) {
+                $match = $false
+                break
+            }
+        }
+
+        if ($match) {
+            $offsets.Add($i)
+
+            if ($NoOverlap) {
+                $i += $needle.Length - 1
+            }
+        }
+    }
+
+    return $offsets.ToArray()
+}
+
+function Invoke-CreoRegionAnalysisEx {
+    [CmdletBinding(DefaultParameterSetName = 'Absolute')]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter(Mandatory, ValueFromPipelineByPropertyName)]
+        [Alias('Block', 'StreamName')]
+        [string]$Stream,
+
+        [Parameter(
+            Mandatory,
+            ParameterSetName = 'Absolute',
+            ValueFromPipelineByPropertyName
+        )]
+        [Alias('AbsoluteOffset')]
+        [object]$Offset,
+
+        [Parameter(
+            Mandatory,
+            ParameterSetName = 'Relative',
+            ValueFromPipelineByPropertyName
+        )]
+        [object]$RelativeOffset,
+
+        [ValidateRange(16, 65536)]
+        [int]$ContextWindow = 256,
+
+        [object]$HighlightPattern = '00 E1 E1 E1 E1 E1 00',
+
+        [switch]$NoColor
+    )
+
+    begin {
+        function ConvertTo-OffsetInteger {
+            param(
+                [Parameter(Mandatory)]
+                [object]$Value,
+
+                [Parameter(Mandatory)]
+                [string]$ParameterName
+            )
+
+            if ($Value -is [int]) {
+                return [int]$Value
+            }
+
+            if ($Value -is [long]) {
+                if ($Value -gt [int]::MaxValue -or $Value -lt 0) {
+                    throw "$ParameterName '$Value' is outside supported 32-bit offset range."
+                }
+
+                return [int]$Value
+            }
+
+            $text = [string]$Value
+
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                throw "$ParameterName cannot be empty."
+            }
+
+            $text = $text.Trim()
+
+            if ($text -match '^0x[0-9A-Fa-f]+$') {
+                return [Convert]::ToInt32($text.Substring(2), 16)
+            }
+
+            if ($text -match '^[0-9A-Fa-f]+$' -and $text -match '[A-Fa-f]') {
+                return [Convert]::ToInt32($text, 16)
+            }
+
+            try {
+                return [Convert]::ToInt32($text, 10)
+            }
+            catch {
+                throw "Cannot convert $ParameterName '$Value' to an integer offset."
+            }
+        }
+    }
+
+    process {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw "File not found: $Path"
+        }
+
+        $resolved = Resolve-CreoFileStreams -Path $Path
+
+        $targetStream = $resolved.Streams |
+            Where-Object { $_.Name -eq $Stream } |
+            Select-Object -First 1
+
+        if ($null -eq $targetStream) {
+            throw "Stream '$Stream' was not found in '$Path'."
+        }
+
+        [int]$streamStart = $targetStream.PayloadStart
+        [int]$streamLength = $targetStream.PayloadLength
+        [int]$streamEndExclusive = $streamStart + $streamLength
+
+        if ($PSCmdlet.ParameterSetName -eq 'Relative') {
+            [int]$relative = ConvertTo-OffsetInteger `
+                -Value $RelativeOffset `
+                -ParameterName 'RelativeOffset'
+
+            if ($relative -lt 0 -or $relative -ge $streamLength) {
+                throw (
+                    "Relative offset 0x$($relative.ToString('X')) is outside stream '$Stream' " +
+                    "(payload length 0x$($streamLength.ToString('X'))."
+                )
+            }
+
+            [int]$absolute = $streamStart + $relative
+        }
+        else {
+            [int]$absolute = ConvertTo-OffsetInteger `
+                -Value $Offset `
+                -ParameterName 'Offset'
+
+            if ($absolute -lt $streamStart -or $absolute -ge $streamEndExclusive) {
+                throw (
+                    "Absolute offset 0x$($absolute.ToString('X8')) is outside stream '$Stream' " +
+                    "(range 0x$($streamStart.ToString('X8'))..0x$(($streamEndExclusive - 1).ToString('X8')))."
+                )
+            }
+
+            [int]$relative = $absolute - $streamStart
+        }
+
+        [int]$before = [Math]::Floor($ContextWindow / 2)
+        [int]$after = $ContextWindow - $before
+
+        [int]$dumpStart = [Math]::Max($streamStart, $absolute - $before)
+        [int]$dumpEndExclusive = [Math]::Min(
+            $streamEndExclusive,
+            $absolute + $after
+        )
+
+        [int]$dumpLength = $dumpEndExclusive - $dumpStart
+
+        Write-Host ''
+        Write-Host '=====================================================================' -ForegroundColor Cyan
+        Write-Host (
+            ' CREO REGION ANALYSIS: {0} | Absolute 0x{1:X8} | Relative 0x{2:X8}' -f
+            $Stream, $absolute, $relative
+        ) -ForegroundColor Cyan
+        Write-Host '=====================================================================' -ForegroundColor Cyan
+
+        Write-Host (
+            "`n[+] Hex window: absolute 0x{0:X8}..0x{1:X8} ({2} bytes)" -f
+            $dumpStart,
+            ($dumpEndExclusive - 1),
+            $dumpLength
+        ) -ForegroundColor Yellow
+
+        Show-CreoHexDumpPatternEx `
+            -Path $Path `
+            -StreamName $Stream `
+            -Offset $dumpStart `
+            -Length $dumpLength `
+            -Pattern $HighlightPattern `
+            -NoColor:$NoColor
+
+        $schema = @(Get-CreoStreamSchema `
+            -ResolvedStream $targetStream `
+            -FileBytes $resolved.Data)
+
+        $nearbySchema = $schema | Where-Object {
+            $_.AbsoluteOffset -ge $dumpStart -and
+            $_.AbsoluteOffset -lt $dumpEndExclusive
+        }
+
+        if (@($nearbySchema).Count -gt 0) {
+            Write-Host '[+] Nearby Parsed Schema Properties' -ForegroundColor Yellow
+
+            $nearbySchema |
+                Select-Object AbsoluteOffset, OpcodeType, PropertyName, ValueOffset |
+                Format-Table -AutoSize |
+                Out-String |
+                Write-Host
+        }
+        else {
+            Write-Host '[-] No E0 schema properties begin inside this window.' -ForegroundColor DarkGray
+        }
+
+        # Optional: retain the module's existing parameter extraction,
+        # but do not fail the region analyzer if that helper is unavailable.
+        $parameterExtractor = Get-Command -Name Get-CreoParametersFromPayloadPS -ErrorAction SilentlyContinue
+
+        if ($null -ne $parameterExtractor) {
+            [byte[]]$payload = $resolved.Data[$streamStart..($streamEndExclusive - 1)]
+            $parameters = @(Get-CreoParametersFromPayloadPS -Payload $payload)
+
+            if ($parameters.Count -gt 0) {
+                Write-Host '[+] E1/E3 Parameters Found in Stream (Top 5)' -ForegroundColor Yellow
+
+                $parameters |
+                    Select-Object -First 5 |
+                    Format-Table ParameterName, TypeName, ParameterValue -AutoSize |
+                    Out-String |
+                    Write-Host
+            }
+        }
+
+        Write-Host '=====================================================================' -ForegroundColor Cyan
+        Write-Host ''
+    }
+}
+
+
+
+# -------------------------------------------------------------------------
+#    POWERSHELL - PS fallback function. Paste as a new top-level function,
+#    next to Get-CreoParametersFromPayloadPS (same section of the module).
+#    Not exported - internal helper, same as Get-CreoParametersFromPayloadPS.
+# -------------------------------------------------------------------------
+function Get-CreoNamedFramesFromPayloadPS {
+    param(
+        [byte[]]$Payload,
+        [string[]]$TargetNames
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $scanLimit = $Payload.Length - 12
+    $targetSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$TargetNames, [System.StringComparer]::Ordinal)
+
+    for ($i = 0; $i -lt $scanLimit; $i++) {
+        if ($Payload[$i] -ne 0xE1 -or $Payload[$i + 1] -ne 0xE1) { continue }
+
+        $isPart = $Payload[$i + 2] -eq 0x00 -and $Payload[$i + 3] -eq 0xE3
+        $isAsm  = $Payload[$i + 2] -eq 0x01 -and $Payload[$i + 3] -eq 0xE3
+        if (-not $isPart -and -not $isAsm) { continue }
+
+        $nameStart = $i + 4
+        $nameEnd = -1
+        for ($z = $nameStart; $z -lt $Payload.Length; $z++) { if ($Payload[$z] -eq 0) { $nameEnd = $z; break } }
+        if ($nameEnd -le $nameStart) { continue }
+
+        $name = [System.Text.Encoding]::ASCII.GetString($Payload[$nameStart..($nameEnd - 1)])
+        if (-not $targetSet.Contains($name)) { continue }
+
+        $typeMarkerStart = $nameEnd + 1
+        if (($typeMarkerStart + 1) -ge $Payload.Length) { continue }
+
+        $typeHex = ([int]$Payload[$typeMarkerStart] -shl 8) -bor [int]$Payload[$typeMarkerStart + 1]
+        $typeName = switch ($typeHex) {
+            0xE232 { "Real" }
+            0xE233 { "String" }
+            0xE234 { "Integer" }
+            0xE235 { "Boolean" }
+            default { "Unknown" }
+        }
+
+        $valueStart = $typeMarkerStart + 2
+        $value = $null
+        $jumpIndex = $valueStart
+
+        # Mirrors the C# fix exactly - see ExtractNamedFrames/ExtractParameters
+        # NOTE for why a 0x00 immediately at valueStart must be read as a
+        # valid empty string, not skipped past.
+        if ($valueStart -lt $Payload.Length) {
+            switch ($typeName) {
+                "Boolean" {
+                    if (($valueStart + 3) -lt $Payload.Length) {
+                        $value = if ($Payload[$valueStart] -eq 0x01) { "YES" } else { "NO" }
+                        $jumpIndex = $valueStart + 4
+                    }
+                }
+                "Integer" {
+                    if (($valueStart + 7) -lt $Payload.Length) {
+                        $value = "(Integer - raw payload not decoded)"
+                        $jumpIndex = $valueStart + 8
+                    }
+                }
+                "Real" {
+                    if (($valueStart + 7) -lt $Payload.Length) {
+                        $value = "(Real - raw payload not decoded)"
+                        $jumpIndex = $valueStart + 8
+                    }
+                }
+                "String" {
+                    if ($Payload[$valueStart] -eq 0x00) {
+                        $value = ""
+                        $jumpIndex = $valueStart + 1
+                    }
+                    else {
+                        $valueEnd = -1
+                        for ($z = $valueStart; $z -lt $Payload.Length; $z++) { if ($Payload[$z] -eq 0) { $valueEnd = $z; break } }
+                        if ($valueEnd -gt $valueStart) {
+                            $value = [System.Text.Encoding]::ASCII.GetString($Payload[$valueStart..($valueEnd - 1)])
+                            $jumpIndex = $valueEnd
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($null -ne $value) {
+            $results.Add([PSCustomObject]@{ Name = $name; Value = $value; TypeName = $typeName; Offset = $i })
+        }
+        $i = [Math]::Max($i, $jumpIndex)
+    }
+
+    return $results
+}
+
+# =========================================================================
+# Get-CreoBOM additions for CreoParser.psm1
+#
+# PURE ADDITIONS. Nothing existing was modified - no changes to
+# ExtractParameters, Get-CreoParametersFromPayloadPS, Get-CreoParameter,
+# Resolve-CreoFileStreams, or anything else. Five things to paste in,
+# each marked below with exactly where it goes. Built against the
+# 2530-line copy you originally sent me, so verify the anchor functions
+# (ExtractParameters, Get-CreoParametersFromPayloadPS, Get-CreoParameter,
+# Export-ModuleMember) still exist under those names in your current file
+# before pasting - if you renamed any of them, adjust the anchor, the new
+# code doesn't care what's around it.
+#
+# WHY A SEPARATE SCANNER INSTEAD OF FILTERING Get-CreoParameter's OUTPUT:
+# "ConfigName" is mixed-case. ExtractParameters' name-validity filter only
+# accepts A-Z/0-9/_ and silently drops anything else - no error, just no
+# hit. That's why "ConfigName" already sits in Get-CreoParameter's
+# NoiseList: it was inert, filtering a hit that could never occur. Rather
+# than loosen the filter on the parameter extractor everyone else depends
+# on (risk to already-tested behavior), this adds a second method that
+# shares the identical frame signature and value-extraction logic, but
+# matches names exactly against a caller-supplied set instead of the
+# uppercase filter. ExtractParameters is untouched.
+#
+# VALIDATION STATUS - read before trusting Quantity at scale:
+# Confirmed: the E1E1[00|01]E3 frame signature is real (same one
+# Get-CreoParameter already relies on). In the enclosure.asm.5 excerpt,
+# "ConfigName" repeats scale with what look like real quantities
+# (LOWER_BACK x2, UPPER_BACK x2).
+# NOT yet confirmed:
+#   1. That raw repeat count always equals true physical instance count,
+#      as opposed to e.g. one instance being recorded twice across two
+#      related structural entries.
+#   2. That ConfigName captures every BOM member. In that same excerpt,
+#      TITLE_BLOCK arrives via a DIFFERENT parameter - PTC_SYMBOL_NAME,
+#      not ConfigName - right next to the ConfigName run. That's plausibly
+#      a drawing-format/title-block symbol rather than a physical part,
+#      which might be correct to exclude from a physical BOM - but that's
+#      an assumption, not something either of us has verified yet.
+# Before trusting Quantity against real data: pick one assembly with a
+# BOM you already know (or can export from Creo) and diff this output
+# against it, the same way the prt0001 sequence validated PDMTrail_L03.
+# =========================================================================
+
+function Get-CreoBOM {
+    <#
+    .SYNOPSIS
+        Extracts a Bill of Materials (component name + quantity) from a
+        Creo assembly file via repeated 'ConfigName' parameter frames.
+    .DESCRIPTION
+        Scans the given stream(s) - NeuAsmSld by default, the only one
+        confirmed so far - for the validated E1 E1 [00|01] E3 <name>\0
+        E2 <typeByte> parameter-frame signature, filtered to frames named
+        "ConfigName". That name is mixed-case, which is exactly why
+        Get-CreoParameter's ALL-CAPS-only filter drops it silently (it's
+        sat inert in Get-CreoParameter's default NoiseList for that
+        reason). Each ConfigName frame's String value is a component
+        name; grouping by value and counting repeats gives
+        (ComponentName, Quantity).
+
+        VALIDATION STATUS - not yet fully confirmed, read before trusting
+        Quantity at scale. Confirmed: the frame signature is real and
+        repeat count tracked plausible quantities in the one example
+        checked (enclosure.asm.5: LOWER_BACK x2, UPPER_BACK x2). NOT
+        confirmed: that raw repeat count always equals true physical
+        quantity, or that ConfigName captures every BOM member - the same
+        excerpt shows TITLE_BLOCK arriving via a different parameter
+        (PTC_SYMBOL_NAME), not ConfigName, plausibly because it's a
+        drawing-format symbol rather than a physical part. Validate
+        against an assembly with a known BOM before trusting this on
+        files you haven't checked by hand.
+    .PARAMETER Path
+        Path to one or more Creo assembly files. Accepts pipeline input.
+    .PARAMETER StreamNames
+        Streams to scan for ConfigName frames. Defaults to NeuAsmSld, the
+        only stream confirmed so far - widen if you find it elsewhere.
+    .PARAMETER TargetNames
+        Frame name(s) to match. Defaults to "ConfigName". Exposed as a
+        parameter (rather than hardcoded) since the underlying scanner
+        is general-purpose - useful later for other mixed-case system
+        fields that ExtractParameters can't reach.
+    .EXAMPLE
+        Get-CreoBOM -Path .\enclosure.asm.5 | Format-Table -AutoSize
+    .EXAMPLE
+        Get-ChildItem -Filter "*.asm*" | Get-CreoBOM | Export-Csv bom.csv -NoTypeInformation
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias("FullName")]
+        [string[]]$Path,
+        [string[]]$StreamNames = @("NeuAsmSld"),
+        [string[]]$TargetNames = @("ConfigName")
+    )
+
+    process {
+        foreach ($filePath in $Path) {
+            $resolvedPaths = Resolve-Path -Path $filePath -ErrorAction SilentlyContinue
+            foreach ($rp in $resolvedPaths) {
+                $fileInfo = [System.IO.FileInfo]::new($rp.Path)
+                if (-not $fileInfo.Exists) { continue }
+
+                $resolved = Resolve-CreoFileStreams -Path $fileInfo.FullName
+                $streams = $resolved.Streams | Where-Object { $_.Name -in $StreamNames }
+
+                if (-not $streams) {
+                    Write-Warning "$($fileInfo.Name): none of the target streams ($($StreamNames -join ', ')) were found - not an assembly, or ConfigName lives somewhere else in this file."
+                    continue
+                }
+
+                $allHits = New-Object System.Collections.Generic.List[object]
+                foreach ($stream in $streams) {
+                    $payload = $resolved.Data[$stream.PayloadStart..($stream.PayloadStart + $stream.PayloadLength - 1)]
+
+                    $hits = if ($script:UseCSharpEngine) { [CreoNative]::ExtractNamedFrames($payload, $TargetNames) }
+                    else { Get-CreoNamedFramesFromPayloadPS -Payload $payload -TargetNames $TargetNames }
+
+                    foreach ($h in $hits) {
+                        [void]$allHits.Add([PSCustomObject]@{
+                            Stream = $stream.Name
+                            Name   = $h.Name
+                            Value  = $h.Value
+                            Offset = $stream.PayloadStart + $h.Offset   # absolute file offset, not payload-relative
+                        })
+                    }
+                }
+
+                if ($allHits.Count -eq 0) {
+                    Write-Warning "$($fileInfo.Name): no ConfigName frames found in $($StreamNames -join ', ')."
+                    continue
+                }
+
+                $parentAssembly = ($fileInfo.Name -replace '(?i)\.(asm|prt)(\.\d+)?$', '')
+
+                $grouped = $allHits | Where-Object { $_.Value } | Group-Object Value
+                foreach ($g in $grouped) {
+                    [PSCustomObject]@{
+                        ParentAssembly = $parentAssembly
+                        ComponentName  = $g.Name
+                        Quantity       = $g.Count
+                        SourceFile     = $fileInfo.Name
+                        FirstOffset    = ("0x{0:X8}" -f ($g.Group[0].Offset))
+                    }
+                }
+            }
+        }
+    }
+}
+
+# =========================================================================
+# Get-CreoInstanceBOM + Get-CreoVersionHistory additions for CreoParser.psm1
+#
+# PURE ADDITIONS - nothing existing touched, including the Get-CreoBOM /
+# ExtractNamedFrames patch from before. Four things to paste in, anchored
+# to function/class names, not line numbers.
+#
+# WHAT THIS IS AND ISN'T:
+# Both of these are ports of a DIFFERENT module's logic, adapted to this
+# module's architecture (C# for the raw byte scan, PowerShell for
+# interpretation) - they are NOT independently re-derived from this
+# module's own byte-level evidence the way E1E1[00|01]E3 was. Treat them
+# as second opinions to cross-check against what you already have
+# (Get-CreoBOM for BOM, the rev_string/PDMTrail_L03 thread for history),
+# not replacements. Ported faithfully where the original logic was
+# preserved - noted inline anywhere behavior was intentionally changed.
+# =========================================================================
+
+function Get-CreoInstanceMarkersFromPayloadPS {
+    param([byte[]]$Payload)
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $markerA = [byte[]]@(0xE3, 0x7B, 0xE2)
+    $markerB = [byte[]]@(0x6E, 0x61, 0x6D, 0x65, 0x00)  # "name\0"
+    $scanLimit = $Payload.Length - 10
+
+    for ($i = 0; $i -lt $scanLimit; $i++) {
+        $isA = $true
+        for ($j = 0; $j -lt $markerA.Length; $j++) { if ($Payload[$i + $j] -ne $markerA[$j]) { $isA = $false; break } }
+
+        $isB = $false
+        if (-not $isA) {
+            $isB = $true
+            for ($j = 0; $j -lt $markerB.Length; $j++) { if ($Payload[$i + $j] -ne $markerB[$j]) { $isB = $false; break } }
+            if ($isB -and $i -gt 0 -and $Payload[$i - 1] -eq 0x5F) { $isB = $false }
+        }
+
+        if (-not $isA -and -not $isB) { continue }
+
+        $offsetShift = if ($isA) { 4 } else { $markerB.Length }
+        $stringStart = $i + $offsetShift
+        $stringEnd = -1
+        for ($z = $stringStart; $z -lt $Payload.Length; $z++) { if ($Payload[$z] -eq 0) { $stringEnd = $z; break } }
+
+        if ($stringEnd -gt $stringStart) {
+            $rawString = [System.Text.Encoding]::ASCII.GetString($Payload[$stringStart..($stringEnd - 1)])
+            $cleanName = $rawString.Split('#')[0]
+
+            $sb = New-Object System.Text.StringBuilder
+            $inTag = $false
+            foreach ($ch in $cleanName.ToCharArray()) {
+                if ($ch -eq '<') { $inTag = $true; continue }
+                if ($ch -eq '>') { $inTag = $false; continue }
+                if (-not $inTag) { [void]$sb.Append($ch) }
+            }
+            $cleanNameStr = $sb.ToString().Trim()
+
+            $isValid = $cleanNameStr.Length -gt 5
+            if ($isValid) {
+                foreach ($ch in $cleanNameStr.ToCharArray()) {
+                    if (-not (($ch -ge 'A' -and $ch -le 'Z') -or ($ch -ge 'a' -and $ch -le 'z') -or ($ch -ge '0' -and $ch -le '9') -or $ch -eq '_' -or $ch -eq '-')) {
+                        $isValid = $false; break
+                    }
+                }
+            }
+
+            if ($isValid) {
+                $results.Add([PSCustomObject]@{
+                    RawName    = $cleanNameStr
+                    MarkerType = if ($isA) { "E3_7B_E2" } else { "name_literal" }
+                    Offset     = $i
+                })
+            }
+            $i = $stringEnd
+        }
+    }
+
+    return $results
+}
+
+function Get-CreoNullTerminatedStringsFromPayloadPS {
+    param([byte[]]$Payload, [int]$MinLen = 2)
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[byte]
+
+    for ($i = 0; $i -lt $Payload.Length; $i++) {
+        $b = $Payload[$i]
+        if ($b -ge 32 -and $b -le 126) {
+            [void]$current.Add($b)
+        }
+        elseif ($b -eq 0 -and $current.Count -ge $MinLen) {
+            $results.Add([PSCustomObject]@{
+                Text          = [System.Text.Encoding]::ASCII.GetString($current.ToArray())
+                EndByteIndex  = $i
+            })
+            $current.Clear()
+        }
+        else {
+            $current.Clear()
+        }
+    }
+
+    return $results
+}
+
+function Get-CreoInstanceBOM {
+    <#
+    .SYNOPSIS
+        Extracts a Bill of Materials via the E3 7B E2 / literal "name\0"
+        instance markers - a second, independent BOM signal alongside
+        Get-CreoBOM's ConfigName-frame approach, ported from an earlier
+        module of yours.
+    .DESCRIPTION
+        Two-pass extraction, same shape as the module this was ported
+        from. Pass 1 builds a dictionary of full candidate names by
+        loosely regex-scanning $DictionaryBlocks (default FeatDefsCmp,
+        NeuAsmSld, MdlRefInfo) for part-number-shaped tokens (8+ chars,
+        at least one letter, one digit, one dash/underscore). Pass 2
+        scans $InstanceBlock (default FeatDefsCmp) for the raw
+        E3 7B E2 / "name\0" markers, then for each hit checks whether
+        the raw name is a truncated PREFIX of a longer Pass-1 dictionary
+        entry, substituting the longer name before counting - the
+        anti-truncation step.
+
+        VALIDATION STATUS: ported wholesale on the strength of "produced
+        good output before," not independently re-derived against this
+        module's own byte-level evidence the way ConfigName was. Neither
+        marker has a documented structural meaning here. Cross-check
+        against Get-CreoBOM's output on the same file rather than
+        trusting either alone - on ul7.asm.8, E3 7B E2 hit FeatDefsCmp
+        only once, which can't be a complete BOM by itself; run this
+        function (it checks "name\0" too) before concluding the marker
+        approach doesn't apply to that file.
+    .PARAMETER Path
+        Path to one or more Creo assembly files. Accepts pipeline input.
+    .PARAMETER DictionaryBlocks
+        Streams scanned in Pass 1 to build the anti-truncation dictionary.
+    .PARAMETER InstanceBlock
+        Stream scanned in Pass 2 for the actual instance markers.
+    .PARAMETER ExcludeNames
+        Cleaned candidate names to always reject, case-insensitive. The
+        original hardcoded "Set24" here - moved to a parameter since it
+        was presumably noise specific to whatever file it was tuned
+        against originally; add to or clear this as your own files show.
+    .EXAMPLE
+        Get-CreoInstanceBOM -Path .\asm0001.asm.1 | Format-Table -AutoSize
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias("FullName")]
+        [string[]]$Path,
+        [string[]]$DictionaryBlocks = @("FeatDefsCmp", "NeuAsmSld", "MdlRefInfo"),
+        [string]$InstanceBlock = "FeatDefsCmp",
+        [string[]]$ExcludeNames = @("Set24")
+    )
+
+    process {
+        foreach ($filePath in $Path) {
+            $resolvedPaths = Resolve-Path -Path $filePath -ErrorAction SilentlyContinue
+            foreach ($rp in $resolvedPaths) {
+                $fileInfo = [System.IO.FileInfo]::new($rp.Path)
+                if (-not $fileInfo.Exists) { continue }
+
+                $resolved = Resolve-CreoFileStreams -Path $fileInfo.FullName
+                $parentAssembly = ($fileInfo.Name -replace '(?i)\.(asm|prt)(\.\d+)?$', '')
+
+                # Pass 1: anti-truncation dictionary.
+                $knownNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($blockName in $DictionaryBlocks) {
+                    $stream = $resolved.Streams | Where-Object { $_.Name -eq $blockName } | Select-Object -First 1
+                    if (-not $stream) { continue }
+                    $payload = $resolved.Data[$stream.PayloadStart..($stream.PayloadStart + $stream.PayloadLength - 1)]
+                    $ascii = [System.Text.Encoding]::ASCII.GetString($payload)
+                    foreach ($m in [regex]::Matches($ascii, '[A-Za-z0-9_\-]{8,}')) {
+                        if ($m.Value -match '[A-Za-z]' -and $m.Value -match '[0-9]' -and $m.Value -match '[\-_]') {
+                            [void]$knownNames.Add($m.Value)
+                        }
+                    }
+                }
+                $sortedKnownNames = @($knownNames | Sort-Object Length -Descending)
+
+                # Pass 2: raw instance markers.
+                $instanceStream = $resolved.Streams | Where-Object { $_.Name -eq $InstanceBlock } | Select-Object -First 1
+                if (-not $instanceStream) {
+                    Write-Warning "$($fileInfo.Name): instance block '$InstanceBlock' not found."
+                    continue
+                }
+                $instancePayload = $resolved.Data[$instanceStream.PayloadStart..($instanceStream.PayloadStart + $instanceStream.PayloadLength - 1)]
+
+                $hits = if ($script:UseCSharpEngine) { [CreoNative]::ExtractInstanceMarkers($instancePayload) }
+                else { Get-CreoInstanceMarkersFromPayloadPS -Payload $instancePayload }
+
+                if ($hits.Count -eq 0) {
+                    Write-Warning "$($fileInfo.Name): no E3 7B E2 / name-literal markers found in $InstanceBlock."
+                    continue
+                }
+
+                $resolvedNames = foreach ($h in $hits) {
+                    if ($h.RawName -in $ExcludeNames) { continue }
+
+                    $resolvedName = $h.RawName
+                    foreach ($kn in $sortedKnownNames) {
+                        if ($kn.StartsWith($h.RawName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                            $resolvedName = $kn
+                            break
+                        }
+                    }
+
+                    [PSCustomObject]@{
+                        RawName      = $h.RawName
+                        ResolvedName = $resolvedName
+                        MarkerType   = $h.MarkerType
+                        Offset       = $instanceStream.PayloadStart + $h.Offset
+                    }
+                }
+
+                $grouped = $resolvedNames | Where-Object { $_.ResolvedName -ne $parentAssembly } | Group-Object ResolvedName
+                foreach ($g in $grouped) {
+                    [PSCustomObject]@{
+                        ParentAssembly = $parentAssembly
+                        ComponentName  = $g.Name
+                        Quantity       = $g.Count
+                        SourceFile     = $fileInfo.Name
+                        FirstOffset    = ("0x{0:X8}" -f (($g.Group | Sort-Object Offset)[0].Offset))
+                        MarkerTypes    = (($g.Group.MarkerType | Sort-Object -Unique) -join '; ')
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Get-CreoVersionHistory {
+    <#
+    .SYNOPSIS
+        Extracts save/version-history events (hostname, user, Creo
+        version, revision, parent file, and an experimental timestamp
+        decode) from a Creo file. Ported from a separate module's
+        ParseVersionHistory.
+    .DESCRIPTION
+        Scans $StreamNames (default MdlStatus - inherited from the
+        module this was ported from, not independently re-derived here)
+        for null-terminated ASCII strings, then for each string
+        beginning with the literal "Hostname: '" prefix, assembles an
+        event by looking at nearby strings within fixed windows:
+          - CreoVersion: next 1-3 strings, either "Creo <ver>" or a bare
+            version-shaped string matching ^\d+\.\d+.
+          - Revision / ParentFile: anywhere within +/-15 strings, the
+            value immediately following a literal "rev_string" /
+            "from_mdl_name" string.
+          - UserName: scanning BACKWARD up to 8 strings, the first one
+            that isn't in the blacklist below, has no spaces, length>=4,
+            and matches [a-zA-Z0-9._-]+.
+          - Timestamp (EXPERIMENTAL, NOT confirmed): once a UserName
+            candidate is found, checks whether the byte right after its
+            null terminator is 0xE2, and if so reads 6 more bytes as a
+            packed date: [sec][min][hour][day][month0][year-1900] at
+            offsets +2..+7 from that null terminator. This is a
+            genuinely DIFFERENT hypothesis than the raw-Unix-epoch guess
+            for UserName -> "1517522437C" in HANDOFF.md - different byte
+            layout, found via a different scan (proximity to
+            "Hostname:", not necessarily the same SolidPersistTable
+            field). Test against a file with a known real save date
+            (e.g. a prt0001.1-10 resave) before trusting it - and don't
+            assume it and the HANDOFF hypothesis are describing the same
+            underlying field just because both produce a plausible date.
+
+        Blacklist (excluded from UserName candidates): user_name,
+        comment, rel_level, rev_string, time, rec_uobj_id, Proe_version,
+        Attributes, from_mdl_name, to_mdl_name.
+    .PARAMETER Path
+        Path to one or more Creo files. Accepts pipeline input.
+    .PARAMETER StreamNames
+        Streams to scan for history strings. Defaults to MdlStatus.
+    .EXAMPLE
+        Get-CreoVersionHistory -Path .\prt0001.prt.5 | Format-Table -AutoSize
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias("FullName")]
+        [string[]]$Path,
+        [string[]]$StreamNames = @("MdlStatus")
+    )
+
+    process {
+        foreach ($filePath in $Path) {
+            $resolvedPaths = Resolve-Path -Path $filePath -ErrorAction SilentlyContinue
+            foreach ($rp in $resolvedPaths) {
+                $fileInfo = [System.IO.FileInfo]::new($rp.Path)
+                if (-not $fileInfo.Exists) { continue }
+
+                $resolved = Resolve-CreoFileStreams -Path $fileInfo.FullName
+                $streams = $resolved.Streams | Where-Object { $_.Name -in $StreamNames }
+
+                if (-not $streams) {
+                    Write-Warning "$($fileInfo.Name): none of the target streams ($($StreamNames -join ', ')) were found."
+                    continue
+                }
+
+                $blacklist = @("user_name", "comment", "rel_level", "rev_string", "time", "rec_uobj_id", "Proe_version", "Attributes", "from_mdl_name", "to_mdl_name")
+
+                foreach ($stream in $streams) {
+                    $payload = $resolved.Data[$stream.PayloadStart..($stream.PayloadStart + $stream.PayloadLength - 1)]
+
+                    $strings = if ($script:UseCSharpEngine) { [CreoNative]::ExtractNullTerminatedStrings($payload, 2) }
+                    else { Get-CreoNullTerminatedStringsFromPayloadPS -Payload $payload -MinLen 2 }
+
+                    if ($strings.Count -eq 0) { continue }
+
+                    for ($i = 0; $i -lt $strings.Count; $i++) {
+                        $current = $strings[$i]
+                        if (-not $current.Text.StartsWith("Hostname: '")) { continue }
+
+                        $hostname = $current.Text.Substring(11).TrimEnd("'")
+                        $creoVersion = $null
+                        $revision = $null
+                        $parentFile = $null
+                        $userName = $null
+                        $timestamp = $null
+                        $timestampRawBytes = $null
+
+                        for ($k = $i + 1; $k -le [Math]::Min($i + 3, $strings.Count - 1); $k++) {
+                            $next = $strings[$k].Text
+                            if ($next.StartsWith("Creo ")) { $creoVersion = $next.Substring(5); break }
+                            elseif ($next -match '^\d+\.\d+') { $creoVersion = $next; break }
+                        }
+
+                        $windowStart = [Math]::Max(0, $i - 15)
+                        $windowEnd = [Math]::Min($strings.Count - 1, $i + 15)
+                        for ($k = $windowStart; $k -le $windowEnd; $k++) {
+                            if ($strings[$k].Text -eq "rev_string" -and ($k + 1) -lt $strings.Count) { $revision = $strings[$k + 1].Text }
+                            if ($strings[$k].Text -eq "from_mdl_name" -and ($k + 1) -lt $strings.Count) { $parentFile = $strings[$k + 1].Text }
+                        }
+
+                        $backEnd = [Math]::Max(0, $i - 8)
+                        for ($j = ($i - 1); $j -ge $backEnd; $j--) {
+                            $prev = $strings[$j].Text
+                            if ($prev -notmatch ' ' -and $prev.Length -ge 4 -and $prev -match '^[a-zA-Z0-9\._\-]+$' -and $prev -notin $blacklist) {
+                                $userName = $prev
+
+                                # EXPERIMENTAL - see .DESCRIPTION.
+                                $nullIndex = $strings[$j].EndByteIndex
+                                if (($nullIndex + 7) -lt $payload.Length -and $payload[$nullIndex + 1] -eq 0xE2) {
+                                    $sc = [int]$payload[$nullIndex + 2]
+                                    $mi = [int]$payload[$nullIndex + 3]
+                                    $hr = [int]$payload[$nullIndex + 4]
+                                    $dy = [int]$payload[$nullIndex + 5]
+                                    $mo = [int]$payload[$nullIndex + 6]
+                                    $yr = [int]$payload[$nullIndex + 7]
+                                    $timestampRawBytes = "sec={0} min={1} hr={2} day={3} mon0={4} yr-1900={5}" -f $sc, $mi, $hr, $dy, $mo, $yr
+
+                                    if ($yr -ge 0 -and $yr -le 200 -and $mo -ge 0 -and $mo -le 11) {
+                                        try { $timestamp = [datetime]::new((1900 + $yr), ($mo + 1), $dy, $hr, $mi, $sc) }
+                                        catch { $timestamp = $null }
+                                    }
+                                }
+                                break
+                            }
+                        }
+
+                        [PSCustomObject]@{
+                            File              = $fileInfo.Name
+                            Stream            = $stream.Name
+                            Hostname          = $hostname
+                            UserName          = $userName
+                            CreoVersion       = $creoVersion
+                            Revision          = $revision
+                            ParentFile        = $parentFile
+                            Timestamp         = $timestamp
+                            TimestampRawBytes = $timestampRawBytes
+                            Offset            = ("0x{0:X8}" -f ($stream.PayloadStart + $current.EndByteIndex - $current.Text.Length))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
 Export-ModuleMember -Function `
     Export-CreoThumbnail, `
     Extract-CreoThumbnail, `
@@ -6069,4 +7865,11 @@ Export-ModuleMember -Function `
     Get-CreoCandidatePlmHashes, `
     Get-CreoInitialInventory, `
     Get-CreoInitialStreamInventory, `
-    Test-CreoInitialInventory
+    Test-CreoInitialInventory, `
+    Show-CreoHexDumpEx, `
+    Show-CreoHexDumpPatternEx, `
+    Find-CreoBytePatternOffsetsEx, `
+    Invoke-CreoRegionAnalysisEx, `
+    Get-CreoBOM, `
+    Get-CreoInstanceBOM, `
+    Get-CreoVersionHistory 
